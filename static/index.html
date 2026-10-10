@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BlastRadius — know what a CVE can reach</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/fix.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand"><span class="brand-mark">B<span>·</span>R</span><span>BLASTRADIUS<small>GRAPH-NATIVE TRIAGE</small></span></div>
+      <div class="rail-section">WORKSPACE</div>
+      <div class="nav-item active"><span class="nav-icon">◇</span> Investigations <span class="nav-arrow">›</span></div>
+      <div class="nav-item"><span class="nav-icon">◎</span> Connected repos</div>
+      <div class="nav-item"><span class="nav-icon">↗</span> Decisions</div>
+      <div class="rail-spacer"></div>
+      <div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Checking graph…</span></div>
+      <div class="rail-note">FalkorDB holds the paths and decisions behind every result.</div>
+    </aside>
+
+    <main>
+      <header class="topbar"><div><span class="eyebrow">SECURITY OPERATIONS / INVESTIGATION</span><h1>Find the real blast radius<span class="accent">.</span></h1><p>From a vulnerability to the services it can actually reach.</p></div><div class="top-tag">PUBLIC REPOS · NPM MVP</div></header>
+
+      <section class="workspace-grid">
+        <div class="panel investigation-panel">
+          <div class="panel-kicker">01 / START HERE</div>
+          <h2>Investigate an advisory</h2>
+          <p class="muted">Enter a CVE or GHSA. BlastRadius traverses each connected repo's dependency graph, then adds declared deployment exposure and ownership.</p>
+          <form id="investigation-form" class="form-stack">
+            <label for="advisory">ADVISORY ID</label>
+            <div class="input-row"><input id="advisory" placeholder="CVE-2024-… or GHSA-…" value="DEMO-2026-001" required><button class="primary" type="submit">Trace impact <span>→</span></button></div>
+            <div class="form-hint">Demo identifier is synthetic and clearly labeled. Real CVEs use GitHub's public advisory database.</div>
+          </form>
+          <div class="divider"></div>
+          <div class="section-heading"><div><div class="panel-kicker">02 / DATA SOURCE</div><h3>Connected repositories</h3></div><span id="repo-count" class="count">0 REPOS</span></div>
+          <div id="repo-list" class="repo-list"><div class="empty-small">No repositories ingested yet.</div></div>
+          <div class="actions"><button id="seed-demo" class="secondary">Load demo graph</button><button id="toggle-connect" class="ghost">+ Connect public repo</button></div>
+          <form id="connect-form" class="connect-form hidden"><label for="repo-input">GITHUB OWNER/REPO</label><div class="input-row"><input id="repo-input" placeholder="owner/repository"><button class="secondary" type="submit">Import</button></div><p>Requires package-lock.json at the repo root. Optional blast-radius.json supplies deployment evidence.</p></form>
+        </div>
+
+        <div class="panel method-panel"><div class="panel-kicker">HOW THE VERDICT IS MADE</div><div class="method-step"><span>1</span><div><strong>Resolve</strong><p>Match advisory ranges to installed package versions.</p></div></div><div class="method-step"><span>2</span><div><strong>Traverse</strong><p>Query the per-repo dependency path in FalkorDB.</p></div></div><div class="method-step"><span>3</span><div><strong>Correlate</strong><p>Join service exposure, owner and earlier decisions.</p></div></div><div class="method-step"><span>4</span><div><strong>Act with evidence</strong><p>Propose a fix only where the evidence supports it.</p></div></div><div class="method-footer">PACKAGE + NETWORK REACHABILITY<br><strong>Function-level code reachability is not claimed.</strong></div></div>
+      </section>
+
+      <section id="results-section" class="results-section hidden"><div class="results-header"><div><div class="panel-kicker">INVESTIGATION RESULTS</div><h2 id="results-title">Advisory impact</h2><p id="results-summary"></p></div><span id="results-severity" class="severity"></span></div><div id="results" class="results"></div></section>
+      <div id="notice" class="notice hidden" role="status"></div>
+      <div id="fix-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="fix-title">
+        <div class="modal"><div class="modal-top"><div><div class="panel-kicker">HUMAN APPROVAL GATE</div><h2 id="fix-title">Review proposed fix</h2></div><button id="close-modal" class="ghost" type="button">Close</button></div><p id="fix-description" class="muted"></p><pre id="fix-diff" class="diff"></pre><label for="admin-key">APPROVAL KEY</label><div class="input-row"><input id="admin-key" type="password" placeholder="BLASTRADIUS_ADMIN_KEY" autocomplete="off"><button id="approve-fix" class="primary" type="button">Open draft PR →</button></div><p class="form-hint">The server also needs a GitHub token with Contents and Pull requests write access. This action creates a branch and draft PR; it does not merge.</p></div>
+      </div>
+      <div id="decision-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="decision-title">
+        <form id="decision-form" class="modal decision-modal"><div class="modal-top"><div><div class="panel-kicker">GRAPH MEMORY</div><h2 id="decision-title">Record a decision</h2></div><button id="close-decision" class="ghost" type="button">Close</button></div><p id="decision-description" class="muted"></p><label for="decision-verdict">DECISION</label><select id="decision-verdict"><option value="investigate">Investigate further</option><option value="accepted_risk">Accept risk</option><option value="remediated">Remediated</option></select><label for="decision-reason">REASON AND EVIDENCE</label><textarea id="decision-reason" required minlength="4" maxlength="500" placeholder="Why did the team make this decision?"></textarea><button class="primary" type="submit">Save to graph →</button></form>
+      </div>
+      <footer>BLASTRADIUS <span>·</span> Every verdict has a path. Unknown stays unknown.</footer>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

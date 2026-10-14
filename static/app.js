@@ -89,6 +89,11 @@ function renderResults(data) {
   $('results-source').textContent = data.source
     ? `${data.source.repo} · latest commit ${data.source.sha.slice(0, 10)} · ${data.source.projects} ${data.source.projects === 1 ? 'project' : 'projects'} · ${data.source.dependencies} dependencies · ${new Date(data.source.scanned_at).toLocaleString()}`
     : 'Synthetic incident · stored graph snapshot';
+  const scope = [];
+  if (data.source && !data.source.project_paths.includes('.')) scope.push('Only the listed subprojects have supported lockfiles; the repository root was not analyzed.');
+  if (data.source?.other_manifests?.length) scope.push(`Other root manifests not analyzed: ${data.source.other_manifests.join(', ')}.`);
+  $('results-scope').textContent = scope.join(' ');
+  $('results-scope').classList.toggle('hidden', !scope.length);
   $('results').innerHTML = data.results.map(resultHtml).join('');
   $('results-section').scrollIntoView({behavior:'smooth', block:'start'});
 }

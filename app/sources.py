@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import io
 import os
 import re
 import json
+import zipfile
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -46,6 +48,7 @@ class Snapshot:
     project_path: str = ""
     importer: str = "."
     lockfile_path: str = "package-lock.json"
+    other_manifests: tuple[str, ...] = ()
 
 
 def _headers() -> dict[str, str]:
@@ -106,8 +109,8 @@ def _services_from_manifest(data: dict[str, Any] | None) -> list[dict[str, Any]]
     return parsed[:20]
 
 
-async def fetch_public_projects(repo: str) -> list[Snapshot]:
-    """Discover bounded npm, pnpm, and Yarn projects at the current SHA."""
+async def _fetch_public_projects_api(repo: str) -> list[Snapshot]:
+    """Use GitHub's API when its public rate limit permits."""
     repo = normalize_repo(repo)
     async with httpx.AsyncClient(timeout=15, headers=_headers(), follow_redirects=False) as client:
         metadata = await client.get(f"https://api.github.com/repos/{repo}")
@@ -128,77 +131,143 @@ async def fetch_public_projects(repo: str) -> list[Snapshot]:
             row["path"] for row in tree.get("tree", [])
             if row.get("type") == "blob" and not any(part in ("node_modules", "vendor") for part in row["path"].split("/"))
         }
-        locks: dict[str, tuple[str, str]] = {}
-        ambiguous: set[str] = set()
-        for path in sorted(paths):
-            filename = path.rsplit("/", 1)[-1]
-            if filename not in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock"):
-                continue
-            folder = path.rpartition("/")[0]
-            if folder in locks and locks[folder][0] != filename:
-                ambiguous.add(folder or ".")
-            else:
-                locks[folder] = (filename, path)
-        if ambiguous:
-            raise ValueError(f"Multiple package-manager lockfiles in {', '.join(sorted(ambiguous))}; choose one lockfile before scanning")
-        if not locks:
-            raise ValueError("No npm, pnpm, or Yarn lockfile was found. This repo has no supported dependency snapshot; no CVE verdict was made")
-        if len(locks) > 20:
-            raise ValueError("More than 20 lockfiles found; narrow project selection is not supported yet")
-        owners = None
-        for owner_path in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
-            if owner_path not in paths:
-                continue
-            owners = await _content(client, repo, owner_path, sha)
-            if owners:
-                break
-        results = []
-        for folder, (filename, lock_path) in sorted(locks.items()):
-            lock_bytes = await _content(client, repo, lock_path, sha)
-            if lock_bytes is None:
-                raise ValueError(f"Lockfile disappeared at {lock_path}; retry the scan")
-            manager = {"package-lock.json": "npm", "pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn"}[filename]
-            if manager == "npm":
-                lockfile = json.loads(lock_bytes)
-                importers = ["."]
-            elif manager == "pnpm":
-                documents = list(yaml.safe_load_all(lock_bytes))
-                if not documents or not isinstance(documents[-1], dict):
-                    raise ValueError(f"Invalid pnpm lockfile at {lock_path}")
-                lockfile = documents[-1]
-                importers = list(lockfile.get("importers", {}))
-            else:
-                lockfile = {}
-                importers = ["."]
-            if len(importers) + len(results) > 30:
-                raise ValueError("More than 30 projects found; narrow project selection is not supported yet")
-            for importer in importers:
-                if importer.startswith("/") or ".." in importer.split("/"):
-                    raise ValueError(f"Invalid pnpm importer path: {importer}")
-                project_path = "/".join(part for part in (folder, importer if importer != "." else "") if part)
-                package_path = f"{project_path}/package.json" if project_path else "package.json"
-                manifest_path = f"{project_path}/blast-radius.json" if project_path else "blast-radius.json"
-                package_bytes = await _content(client, repo, package_path, sha) if package_path in paths else None
-                if manager == "yarn" and package_bytes is None:
-                    raise ValueError(f"Yarn project at {project_path or '.'} needs package.json to identify production dependencies")
-                manifest_bytes = await _content(client, repo, manifest_path, sha) if manifest_path in paths else None
-                results.append(Snapshot(
-                    repo=repo if not project_path else f"{repo}::{project_path}",
-                    sha=sha,
-                    lockfile=lockfile,
-                    package_json=json.loads(package_bytes) if package_bytes else {},
-                    owner=_owner_from_codeowners(owners.decode("utf-8") if owners else None),
-                    services=_services_from_manifest(json.loads(manifest_bytes) if manifest_bytes else None),
-                    source=f"https://github.com/{repo}/tree/{sha}" + (f"/{project_path}" if project_path else ""),
-                    lockfile_text=lock_bytes.decode("utf-8"),
-                    manager=manager,
-                    project_path=project_path,
-                    importer=importer,
-                    lockfile_path=lock_path,
-                ))
+        async def read_file(path: str) -> bytes | None:
+            return await _content(client, repo, path, sha)
+
+        return await _snapshots_from_files(repo, sha, paths, read_file)
+
+
+async def _snapshots_from_files(
+    repo: str, sha: str, paths: set[str], read_file: Callable[[str], Awaitable[bytes | None]]
+) -> list[Snapshot]:
+    excluded = {"node_modules", "vendor", "testdata", "fixtures", "__fixtures__"}
+    paths = {path for path in paths if not excluded.intersection(path.split("/"))}
+    other_manifests = tuple(sorted(paths.intersection({
+        "go.mod", "Cargo.lock", "requirements.txt", "poetry.lock", "uv.lock", "Gemfile.lock", "pom.xml"
+    })))
+    locks: dict[str, tuple[str, str]] = {}
+    ambiguous: set[str] = set()
+    for path in sorted(paths):
+        filename = path.rsplit("/", 1)[-1]
+        if filename not in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock"):
+            continue
+        folder = path.rpartition("/")[0]
+        if folder in locks and locks[folder][0] != filename:
+            ambiguous.add(folder or ".")
+        else:
+            locks[folder] = (filename, path)
+    if ambiguous:
+        raise ValueError(f"Multiple package-manager lockfiles in {', '.join(sorted(ambiguous))}; choose one lockfile before scanning")
+    if not locks:
+        detail = f" Found {', '.join(other_manifests)} at the root." if other_manifests else ""
+        raise ValueError("No supported npm, pnpm, or Yarn lockfile was found; no CVE verdict was made." + detail)
+    if len(locks) > 20:
+        raise ValueError("More than 20 lockfiles found; narrow project selection is not supported yet")
+    owners = None
+    for owner_path in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+        if owner_path not in paths:
+            continue
+        owners = await read_file(owner_path)
+        if owners:
+            break
+    owner = _owner_from_codeowners(owners.decode("utf-8") if owners else None)
+    results: list[Snapshot] = []
+    for folder, (filename, lock_path) in sorted(locks.items()):
+        lock_bytes = await read_file(lock_path)
+        if lock_bytes is None:
+            raise ValueError(f"Lockfile disappeared at {lock_path}; retry the scan")
+        manager = {"package-lock.json": "npm", "pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn"}[filename]
+        if manager == "npm":
+            lockfile = json.loads(lock_bytes)
+            importers = ["."]
+        elif manager == "pnpm":
+            documents = list(yaml.safe_load_all(lock_bytes))
+            if not documents or not isinstance(documents[-1], dict):
+                raise ValueError(f"Invalid pnpm lockfile at {lock_path}")
+            lockfile = documents[-1]
+            importers = list(lockfile.get("importers", {}))
+        else:
+            lockfile = {}
+            importers = ["."]
+        if len(importers) + len(results) > 30:
+            raise ValueError("More than 30 projects found; narrow project selection is not supported yet")
+        for importer in importers:
+            if importer.startswith("/") or ".." in importer.split("/"):
+                raise ValueError(f"Invalid pnpm importer path: {importer}")
+            project_path = "/".join(part for part in (folder, importer if importer != "." else "") if part)
+            package_path = f"{project_path}/package.json" if project_path else "package.json"
+            manifest_path = f"{project_path}/blast-radius.json" if project_path else "blast-radius.json"
+            package_bytes = await read_file(package_path) if package_path in paths else None
+            if manager == "yarn" and package_bytes is None:
+                raise ValueError(f"Yarn project at {project_path or '.'} needs package.json to identify production dependencies")
+            manifest_bytes = await read_file(manifest_path) if manifest_path in paths else None
+            results.append(Snapshot(
+                repo=repo if not project_path else f"{repo}::{project_path}",
+                sha=sha,
+                lockfile=lockfile,
+                package_json=json.loads(package_bytes) if package_bytes else {},
+                owner=owner,
+                services=_services_from_manifest(json.loads(manifest_bytes) if manifest_bytes else None),
+                source=f"https://github.com/{repo}/tree/{sha}" + (f"/{project_path}" if project_path else ""),
+                lockfile_text=lock_bytes.decode("utf-8"),
+                manager=manager,
+                project_path=project_path,
+                importer=importer,
+                lockfile_path=lock_path,
+                other_manifests=other_manifests,
+            ))
     if not results:
         raise ValueError("No supported projects were found in the lockfiles")
     return results
+
+
+async def _fetch_public_projects_archive(repo: str) -> list[Snapshot]:
+    """Use a bounded public source archive when GitHub's API quota is exhausted."""
+    async with httpx.AsyncClient(timeout=40, follow_redirects=False, headers={"User-Agent": "BlastRadius-demo"}) as client:
+        async with client.stream("GET", f"https://codeload.github.com/{repo}/zip/HEAD") as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > 30_000_000:
+                    raise ValueError("Public source archive exceeds the 30 MB scan limit")
+                chunks.append(chunk)
+    with zipfile.ZipFile(io.BytesIO(b"".join(chunks))) as archive:
+        sha = archive.comment.decode("ascii", errors="ignore")
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise ValueError("Source archive did not identify its commit SHA; no scan was made")
+        entries: dict[str, zipfile.ZipInfo] = {}
+        members = archive.infolist()
+        if len(members) > 50_000:
+            raise ValueError("Public source archive has too many files")
+        for member in members:
+            if member.is_dir() or "/" not in member.filename:
+                continue
+            path = member.filename.split("/", 1)[1]
+            if path:
+                entries[path] = member
+
+        async def read_file(path: str) -> bytes | None:
+            member = entries.get(path)
+            if member is None:
+                return None
+            if member.file_size > 5_000_000:
+                raise ValueError(f"{path} is too large for the importer (5 MB limit)")
+            return archive.read(member)
+
+        return await _snapshots_from_files(repo, sha, set(entries), read_file)
+
+
+async def fetch_public_projects(repo: str) -> list[Snapshot]:
+    repo = normalize_repo(repo)
+    try:
+        return await _fetch_public_projects_api(repo)
+    except httpx.HTTPStatusError as exc:
+        limited = exc.response.headers.get("X-RateLimit-Remaining") == "0" or "rate limit" in exc.response.text.lower()
+        if exc.response.status_code == 429 or (exc.response.status_code == 403 and limited):
+            return await _fetch_public_projects_archive(repo)
+        raise
 
 
 async def fetch_public_repo(repo: str) -> Snapshot:

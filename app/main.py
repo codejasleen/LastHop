@@ -232,9 +232,11 @@ async def scan_live(request: LiveScanRequest) -> dict:
         return {
             "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url},
             "results": results,
-            "source": {"repo": request.repo, "sha": snapshots[0].sha, "scanned_at": datetime.now(timezone.utc).isoformat(),
+            "source": {"repo": snapshots[0].repo.split("::")[0], "sha": snapshots[0].sha, "scanned_at": datetime.now(timezone.utc).isoformat(),
                        "dependencies": sum(row["dependencies"] for row in imported), "projects": len(snapshots),
-                       "managers": sorted({snapshot.manager for snapshot in snapshots})},
+                       "managers": sorted({snapshot.manager for snapshot in snapshots}),
+                       "project_paths": [snapshot.project_path or "." for snapshot in snapshots],
+                       "other_manifests": list(snapshots[0].other_manifests)},
         }
     except HTTPException:
         raise

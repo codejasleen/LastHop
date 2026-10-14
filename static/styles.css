@@ -79,6 +79,7 @@ button { border-radius: 7px; padding: 10px 13px; font-size: 12px; font-weight: 6
 .results-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
 .results-header h2 { font-size: 24px; letter-spacing: -.04em; margin: 6px 0; }.results-header p { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; }
 .results-source { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: #7b847c !important; margin-bottom: 7px !important; }
+.results-scope { max-width: 680px; color: #e3c18a !important; margin: 7px 0 10px !important; }
 .severity { color: var(--red); background: #fcf1f0; border: 1px solid #f0d6d3; border-radius: 15px; padding: 6px 9px; font-size: 11px; font-weight: 600; white-space: nowrap; text-transform: capitalize; }
 .results { display: grid; gap: 12px; }
 .result-card { background: var(--surface); border: 1px solid var(--line); border-radius: 9px; padding: 22px 24px; }
@@ -130,6 +131,7 @@ input::placeholder, textarea::placeholder { color: #7f8a80; }
 .scope-note strong, .scope-note small { color: #c5cec4; }
 .scope-note span:before { color: #a8c7a9; }
 .results-header p, .results-source { color: #aab4aa !important; }
+.results-header .results-scope { color: #e3c18a !important; }
 .severity { color: #f6a49c; background: #402b2a; border-color: #67413e; }
 .badge { color: #a6d5ac; background: #2b4030; border-color: #47684c; }
 .affected_exposed .badge { color: #ffaba0; background: #432d2b; border-color: #69413c; }

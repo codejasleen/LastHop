@@ -54,7 +54,7 @@ The app reports **package not present**, **version unaffected**, **affected with
 
 ## Public repo evidence
 
-The live scan reads the default branch SHA and Git tree, discovers supported lockfiles, and reads each project's `package.json`, optional root `CODEOWNERS`, and optional project `blast-radius.json` through the GitHub API. It refuses private repos, truncated Git trees, more than 20 lockfiles, or more than 30 projects. The UI shows the exact commit SHA it scanned. A manifest can declare service exposure:
+The live scan reads the default branch SHA and Git tree, discovers supported lockfiles, and reads each project's `package.json`, optional root `CODEOWNERS`, and optional project `blast-radius.json`. If GitHub's anonymous API quota is exhausted, it reads a bounded public source archive from GitHub instead; the archive must identify the exact commit SHA. CVE lookup then falls back to OSV's public advisory API. It refuses private repos, truncated Git trees, archives over 30 MB, more than 20 lockfiles, or more than 30 projects. The UI shows the exact commit SHA and names any root manifests outside this scanner's scope (for example `go.mod`). A manifest can declare service exposure:
 
 ```json
 {

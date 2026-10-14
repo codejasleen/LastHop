@@ -26,3 +26,8 @@ def test_repo_specific_nested_pin_and_hoisted_resolution():
 def test_missing_lockfile_node_is_not_treated_as_complete_inventory():
     with pytest.raises(ValueError, match="no installed package"):
         parse_lockfile({"packages": {"": {"dependencies": {"missing": "1.0.0"}}}})
+
+
+def test_npm_workspace_is_not_reported_as_an_empty_safe_project():
+    with pytest.raises(ValueError, match="workspace-aware"):
+        parse_lockfile({"packages": {"": {}, "apps/web": {"dependencies": {"qs": "6.5.0"}}}})

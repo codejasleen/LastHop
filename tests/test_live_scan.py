@@ -18,13 +18,16 @@ def test_github_repository_url_is_normalized():
 
 
 def test_live_scan_refreshes_repository_before_tracing(monkeypatch):
-    snapshot = Snapshot("acme/service", "current-sha", {"packages": {}}, {}, "@team", [], "GitHub")
+    snapshot = Snapshot("acme/service", "current-sha", {"packages": {"": {"dependencies": {}}}}, {}, "@team", [], "GitHub")
     events = []
 
     class FakeGraph:
         def ingest(self, item):
             events.append(("ingest", item.sha))
             return {"dependencies": 1}
+
+        def prune_missing_projects(self, repo, current):
+            pass
 
         def context(self, repo, advisory):
             return {"owner": "@team", "services": [], "decisions": []}
@@ -38,13 +41,13 @@ def test_live_scan_refreshes_repository_before_tracing(monkeypatch):
 
     async def fetch_repo(repo):
         assert repo == "https://github.com/acme/service"
-        return snapshot
+        return [snapshot]
 
     async def fetch_advisory(identifier):
         assert identifier == "DEMO-2026-001"
         return DEMO_ADVISORY
 
-    monkeypatch.setattr("app.main.fetch_public_repo", fetch_repo)
+    monkeypatch.setattr("app.main.fetch_public_projects", fetch_repo)
     monkeypatch.setattr("app.main.fetch_advisory", fetch_advisory)
     monkeypatch.setattr("app.main.store", FakeGraph)
     response = asyncio.run(scan_live(LiveScanRequest(repo="https://github.com/acme/service", advisory="DEMO-2026-001")))

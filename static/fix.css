@@ -1,10 +1,10 @@
 .fix-action { margin-top: 17px; }
 .decision-action { margin-top: 17px; margin-left: 7px; }
-.modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: #1b211bbd; padding: 20px; }
-.modal { width: min(920px, 100%); max-height: 90vh; overflow: auto; background: #fff; border: 1px solid #d8dcd6; border-radius: 11px; box-shadow: 0 22px 70px #0003; padding: 26px; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: #090b09ca; padding: 20px; }
+.modal { width: min(920px, 100%); max-height: 90vh; overflow: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: 0 22px 70px #0008; padding: 26px; }
 .modal-top { display: flex; justify-content: space-between; gap: 20px; align-items: start; }.modal-top h2 { margin: 8px 0 0; font-size: 22px; letter-spacing: -.035em; }
-.diff { max-height: 45vh; overflow: auto; border: 1px solid #e5e8e3; border-radius: 7px; background: #f7f8f6; color: #354239; padding: 16px; font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre; }
+.diff { max-height: 45vh; overflow: auto; border: 1px solid var(--line); border-radius: 7px; background: #1c211d; color: #d1ded0; padding: 16px; font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre; }
 .modal>label { margin-top: 19px; }.decision-modal { width: min(570px, 100%); }.decision-modal label { margin-top: 20px; }
-.decision-modal select, .decision-modal textarea { display: block; width: 100%; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--text); background: #fff; padding: 11px 12px; outline: none; }
+.decision-modal select, .decision-modal textarea { display: block; width: 100%; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--text); background: #1d201e; padding: 11px 12px; outline: none; }
 .decision-modal textarea { min-height: 100px; resize: vertical; }.decision-modal>.primary { margin-top: 20px; }
-.decision-memory { margin-top: 15px; border: 1px solid #e4e9e1; background: #f7faf6; border-radius: 7px; padding: 13px; font-size: 11px; color: #647166; }.decision-memory strong { color: #2f5e40; }
+.decision-memory { margin-top: 15px; border: 1px solid #3c5140; background: #27352a; border-radius: 7px; padding: 13px; font-size: 11px; color: #b1c5b2; }.decision-memory strong { color: #a4d5aa; }

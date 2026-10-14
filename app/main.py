@@ -12,9 +12,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .advisories import Advisory, fetch_advisory, is_affected
-from .graph import GraphStore
+from .graph import GraphStore, dependency_graph
 from .fixes import build_preview, create_draft_pr
-from .sources import fetch_public_repo
+from .sources import fetch_public_projects, fetch_public_repo
 from .webhooks import verify_push
 
 
@@ -93,8 +93,13 @@ def seed_demo() -> dict:
 @app.post("/api/repos/ingest")
 async def ingest_repo(request: IngestRequest) -> dict:
     try:
-        snapshot = await fetch_public_repo(request.repo)
-        return store().ingest(snapshot)
+        snapshots = await fetch_public_projects(request.repo)
+        for snapshot in snapshots:
+            dependency_graph(snapshot)
+        graph = store()
+        ingested = [graph.ingest(snapshot) for snapshot in snapshots]
+        graph.prune_missing_projects(snapshots[0].repo.split("::")[0], {snapshot.repo for snapshot in snapshots})
+        return {"ingested": ingested}
     except (ValueError, LookupError) as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
@@ -109,9 +114,14 @@ async def github_push(request: Request) -> dict:
         if not repo:
             return {"refreshed": False}
         graph = store()
-        if not any(row["repo"] == repo for row in graph.repositories()):
+        if not any(row["repo"] == repo or row["repo"].startswith(f"{repo}::") for row in graph.repositories()):
             return {"refreshed": False, "reason": "repository not connected"}
-        return {"refreshed": True, "snapshot": graph.ingest(await fetch_public_repo(repo))}
+        snapshots = await fetch_public_projects(repo)
+        for snapshot in snapshots:
+            dependency_graph(snapshot)
+        ingested = [graph.ingest(snapshot) for snapshot in snapshots]
+        graph.prune_missing_projects(repo, {snapshot.repo for snapshot in snapshots})
+        return {"refreshed": True, "snapshots": ingested}
     except PermissionError as exc:
         raise HTTPException(401, str(exc)) from exc
     except ValueError as exc:
@@ -169,6 +179,7 @@ def investigate_one(graph: GraphStore, repo: str, advisory: Advisory) -> dict:
         "services": context["services"],
         "prior_decisions": context["decisions"],
         "fix_candidates": fix_candidates,
+        "fix_supported": context.get("manager", "npm") == "npm" and not context.get("project_path"),
     }
 
 
@@ -209,14 +220,21 @@ async def scan_live(request: LiveScanRequest) -> dict:
         advisory = await fetch_advisory(request.advisory)
         if not advisory.packages:
             raise ValueError("This advisory has no npm package mapping, so a dependency verdict is unavailable")
-        snapshot = await fetch_public_repo(request.repo)
+        snapshots = await fetch_public_projects(request.repo)
+        for snapshot in snapshots:
+            dependency_graph(snapshot)
         graph = store()
-        imported = graph.ingest(snapshot)
-        result = investigate_one(graph, snapshot.repo, advisory)
+        imported = [graph.ingest(snapshot) for snapshot in snapshots]
+        graph.prune_missing_projects(snapshots[0].repo.split("::")[0], {snapshot.repo for snapshot in snapshots})
+        results = [investigate_one(graph, snapshot.repo, advisory) for snapshot in snapshots]
+        order = {"affected_exposed": 0, "affected_exposure_unknown": 1, "affected_internal_declared": 2, "insufficient_evidence": 3, "not_affected_version": 4, "not_present": 5}
+        results.sort(key=lambda row: (order[row["verdict"]], row["repo"]))
         return {
             "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url},
-            "results": [result],
-            "source": {"repo": snapshot.repo, "sha": snapshot.sha, "url": snapshot.source, "scanned_at": datetime.now(timezone.utc).isoformat(), "dependencies": imported["dependencies"]},
+            "results": results,
+            "source": {"repo": request.repo, "sha": snapshots[0].sha, "scanned_at": datetime.now(timezone.utc).isoformat(),
+                       "dependencies": sum(row["dependencies"] for row in imported), "projects": len(snapshots),
+                       "managers": sorted({snapshot.manager for snapshot in snapshots})},
         }
     except HTTPException:
         raise
@@ -225,6 +243,8 @@ async def scan_live(request: LiveScanRequest) -> dict:
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             raise HTTPException(404, "GitHub repository or advisory was not found") from exc
+        if exc.response.status_code in (403, 429) and exc.response.headers.get("X-RateLimit-Remaining") == "0":
+            raise HTTPException(429, "GitHub API rate limit reached. Set GITHUB_TOKEN on the server or retry after the limit resets") from exc
         raise HTTPException(502, f"GitHub returned HTTP {exc.response.status_code}") from exc
     except httpx.RequestError as exc:
         raise HTTPException(502, "GitHub is unreachable; try again shortly") from exc

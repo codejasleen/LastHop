@@ -19,11 +19,11 @@ python -m venv .venv
 
 Open <http://127.0.0.1:8000>. Or run the whole stack with `docker compose up` (the app container installs Python requirements on startup). The FalkorDB Browser is at <http://127.0.0.1:3000>.
 
-1. Paste a public GitHub repository URL (or `owner/repo`) and enter a CVE or GHSA, then click **Scan latest**. Each scan fetches the current default-branch commit before rebuilding that repo's graph snapshot.
+1. Paste a public GitHub repository URL (or `owner/repo`) and enter a CVE or GHSA, then click **Scan latest**. Each scan fetches the current default-branch commit, discovers supported projects, and rebuilds their separate graph snapshots.
 2. For a tested real example, use `axios/axios` and `CVE-2022-24999`. The result correctly reports that the affected `qs` package is absent from that repo's production dependency snapshot.
 3. Click **Run sample investigation** for a clearly synthetic affected case: a public storefront reached through `web-framework → render-kit`, an affected internal service, and a repo where the package is absent.
 
-This works with arbitrary **public npm repositories that have a root `package-lock.json` v2/v3**. It does not yet inspect private repos, other ecosystems, nested monorepo lockfiles, or function-level call paths. A public GitHub repo needs no sign-in; optional `GITHUB_TOKEN` can raise GitHub API limits and is required for draft PR creation.
+The scanner discovers **npm `package-lock.json` v2/v3**, **pnpm `pnpm-lock.yaml` v9**, and **Yarn Classic `yarn.lock` v1** at any directory, including nested pnpm importers. Each project has its own graph identity and result card. It refuses incomplete or unsupported paths instead of returning a false "not present" result. Private repos, npm/Yarn workspace lockfiles, Yarn Berry/Bun, pnpm workspace links and non-registry references, other ecosystems, and function-level call paths are not supported yet. A public GitHub repo needs no sign-in; optional `GITHUB_TOKEN` raises GitHub API limits and is required for draft PR creation.
 
 Run the focused checks with `.\.venv\Scripts\python.exe -m pytest -q`.
 
@@ -39,7 +39,7 @@ For a reproducible package-only versus graph comparison, run `.\.venv\Scripts\py
 (Repo)-[:HAS_DECISION]->(Decision)
 ```
 
-Each `Dependency` ID includes the repository and exact lockfile installation path. This prevents one repo's stale version from contaminating another repo's result. The importer parses the production `packages` tree in npm lockfile v2/v3, resolves nested and hoisted dependencies, and refuses a lockfile with missing referenced packages. It replaces one repo snapshot at a time and uses `UNWIND … MERGE` batches for nodes and edges, so rerunning an import gives the same graph state. There is no ordinary database standing behind the verdicts.
+Each `Dependency` ID includes the project identity and exact installed package key. This prevents one repo or monorepo project pin from contaminating another result. The npm importer parses production and optional dependencies in lockfile v2/v3, resolves nested and hoisted packages, and refuses missing referenced packages. The pnpm v9 importer follows exact `importers` and `snapshots` keys, including peer suffixes. The Yarn Classic importer uses `package.json` production roots and exact selectors from `yarn.lock`. Workspace links and unresolved selectors currently stop the scan with an explicit unsupported-path error. Ingestion replaces one project snapshot at a time and uses `UNWIND … MERGE` batches for nodes and edges. There is no ordinary database standing behind the verdicts.
 
 The core bounded read query is:
 
@@ -54,7 +54,7 @@ The app reports **package not present**, **version unaffected**, **affected with
 
 ## Public repo evidence
 
-The live scan reads the default branch SHA, root `package.json` and `package-lock.json`, optional `CODEOWNERS`, and optional `blast-radius.json` through the GitHub API. It refuses private repos. The UI shows the exact commit SHA it scanned. A manifest can declare service exposure:
+The live scan reads the default branch SHA and Git tree, discovers supported lockfiles, and reads each project's `package.json`, optional root `CODEOWNERS`, and optional project `blast-radius.json` through the GitHub API. It refuses private repos, truncated Git trees, more than 20 lockfiles, or more than 30 projects. The UI shows the exact commit SHA it scanned. A manifest can declare service exposure:
 
 ```json
 {
@@ -69,7 +69,7 @@ Without this evidence, exposure is **unknown**. Pressing **Scan latest** always 
 
 ## Draft PR gate
 
-For an affected **direct production dependency**, BlastRadius can prepare a lockfile-only update with `npm update --package-lock-only --ignore-scripts`. It checks the patched version against the root declared range and the advisory, shows the diff, then waits for a human to enter `BLASTRADIUS_ADMIN_KEY`. With `GITHUB_TOKEN` configured for Contents and Pull requests write access, approval creates a branch and **draft PR**. It never merges. It rejects a stale graph snapshot if the default branch moved after review. Transitive fixes, out-of-range upgrades, and synthetic repositories remain manual-review cases.
+For an affected **direct production dependency in a root npm project**, BlastRadius can prepare a lockfile-only update with `npm update --package-lock-only --ignore-scripts`. It checks the patched version against the root declared range and the advisory, shows the diff, then waits for a human to enter `BLASTRADIUS_ADMIN_KEY`. With `GITHUB_TOKEN` configured for Contents and Pull requests write access, approval creates a branch and **draft PR**. It never merges. It rejects a stale graph snapshot if the default branch moved after review. Nested npm, pnpm, transitive fixes, out-of-range upgrades, and synthetic repositories remain manual-review cases.
 
 Keep credentials in your local environment or an untracked `.env`; never commit them. The local Docker binding is `127.0.0.1` by default. Put authentication and HTTPS in front of the app before exposing it to other users. GitHub App installation and production authorization are future work; this MVP uses selected public repos and an optional GitHub token for writing a PR.
 

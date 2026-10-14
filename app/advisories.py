@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import os
 from dataclasses import dataclass
 
 import httpx
@@ -44,7 +45,10 @@ async def fetch_advisory(identifier: str) -> Advisory:
     if identifier == DEMO_ADVISORY.identifier:
         return DEMO_ADVISORY
     params = {"cve_id" if identifier.startswith("CVE-") else "ghsa_id": identifier, "ecosystem": "npm"}
-    async with httpx.AsyncClient(timeout=12, headers={"Accept": "application/vnd.github+json", "User-Agent": "BlastRadius-demo"}) as client:
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "BlastRadius-demo"}
+    if token := os.getenv("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {token}"
+    async with httpx.AsyncClient(timeout=12, headers=headers) as client:
         response = await client.get("https://api.github.com/advisories", params=params)
         response.raise_for_status()
         results = response.json()

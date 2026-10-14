@@ -39,10 +39,16 @@ def parse_lockfile(lockfile: dict[str, Any]) -> list[Dependency]:
     packages = lockfile.get("packages")
     if not isinstance(packages, dict) or "" not in packages:
         raise ValueError("A package-lock.json with a packages map (lockfile v2/v3) is required")
+    if any(path and not path.startswith("node_modules/") for path in packages):
+        raise ValueError("npm workspace lockfiles need workspace-aware traversal; no CVE verdict was made")
     installed = {path for path in packages if path}
     root = packages[""]
     rows: dict[str, Dependency] = {}
-    queue: list[tuple[str, str, bool]] = [(name, "", True) for name in root.get("dependencies", {})]
+    queue: list[tuple[str, str, bool]] = [
+        (name, "", True)
+        for group in ("dependencies", "optionalDependencies")
+        for name in root.get(group, {})
+    ]
     seen: set[str] = set()
     while queue:
         name, parent, direct = queue.pop(0)
@@ -58,8 +64,9 @@ def parse_lockfile(lockfile: dict[str, Any]) -> list[Dependency]:
         if path in seen:
             continue
         seen.add(path)
-        for child_name in package.get("dependencies", {}):
-            queue.append((child_name, path, False))
+        for group in ("dependencies", "optionalDependencies"):
+            for child_name in package.get(group, {}):
+                queue.append((child_name, path, False))
     return list(rows.values())
 
 
@@ -69,9 +76,9 @@ def edges_from_lockfile(lockfile: dict[str, Any], dependencies: list[Dependency]
     installed = {item.path for item in dependencies}
     edges: set[tuple[str, str]] = set()
     for parent_path in [""] + [item.path for item in dependencies]:
-        requested = packages[parent_path].get("dependencies", {})
-        for name in requested:
-            child = _resolve(installed, parent_path, name)
-            if child:
-                edges.add((parent_path, child))
+        for group in ("dependencies", "optionalDependencies"):
+            for name in packages[parent_path].get(group, {}):
+                child = _resolve(installed, parent_path, name)
+                if child:
+                    edges.add((parent_path, child))
     return sorted(edges)

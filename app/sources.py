@@ -5,11 +5,13 @@ from __future__ import annotations
 import base64
 import os
 import re
+import json
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+import yaml
 
 
 REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -40,6 +42,10 @@ class Snapshot:
     services: list[dict[str, Any]]
     source: str
     lockfile_text: str | None = None
+    manager: str = "npm"
+    project_path: str = ""
+    importer: str = "."
+    lockfile_path: str = "package-lock.json"
 
 
 def _headers() -> dict[str, str]:
@@ -55,6 +61,12 @@ async def _content(client: httpx.AsyncClient, repo: str, path: str, ref: str) ->
         return None
     response.raise_for_status()
     payload = response.json()
+    if payload.get("size", 0) > 5_000_000:
+        raise ValueError(f"{path} is too large for the importer (5 MB limit)")
+    if payload.get("encoding") == "none" and payload.get("sha"):
+        blob = await client.get(f"https://api.github.com/repos/{repo}/git/blobs/{payload['sha']}")
+        blob.raise_for_status()
+        payload = blob.json()
     if payload.get("encoding") != "base64":
         raise ValueError(f"GitHub did not return inline content for {path}")
     data = base64.b64decode(payload["content"])
@@ -94,9 +106,8 @@ def _services_from_manifest(data: dict[str, Any] | None) -> list[dict[str, Any]]
     return parsed[:20]
 
 
-async def fetch_public_repo(repo: str) -> Snapshot:
-    import json
-
+async def fetch_public_projects(repo: str) -> list[Snapshot]:
+    """Discover bounded npm, pnpm, and Yarn projects at the current SHA."""
     repo = normalize_repo(repo)
     async with httpx.AsyncClient(timeout=15, headers=_headers(), follow_redirects=False) as client:
         metadata = await client.get(f"https://api.github.com/repos/{repo}")
@@ -108,23 +119,92 @@ async def fetch_public_repo(repo: str) -> Snapshot:
         sha_response = await client.get(f"https://api.github.com/repos/{repo}/commits/{branch}")
         sha_response.raise_for_status()
         sha = sha_response.json()["sha"]
-        lock_bytes = await _content(client, repo, "package-lock.json", sha)
-        if lock_bytes is None:
-            raise ValueError("This MVP supports public npm repos with package-lock.json at the root")
-        package_bytes = await _content(client, repo, "package.json", sha)
-        manifest_bytes = await _content(client, repo, "blast-radius.json", sha)
+        tree_response = await client.get(f"https://api.github.com/repos/{repo}/git/trees/{sha}", params={"recursive": 1})
+        tree_response.raise_for_status()
+        tree = tree_response.json()
+        if tree.get("truncated"):
+            raise ValueError("GitHub truncated this repository's file tree; a complete dependency search is unavailable")
+        paths = {
+            row["path"] for row in tree.get("tree", [])
+            if row.get("type") == "blob" and not any(part in ("node_modules", "vendor") for part in row["path"].split("/"))
+        }
+        locks: dict[str, tuple[str, str]] = {}
+        ambiguous: set[str] = set()
+        for path in sorted(paths):
+            filename = path.rsplit("/", 1)[-1]
+            if filename not in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock"):
+                continue
+            folder = path.rpartition("/")[0]
+            if folder in locks and locks[folder][0] != filename:
+                ambiguous.add(folder or ".")
+            else:
+                locks[folder] = (filename, path)
+        if ambiguous:
+            raise ValueError(f"Multiple package-manager lockfiles in {', '.join(sorted(ambiguous))}; choose one lockfile before scanning")
+        if not locks:
+            raise ValueError("No npm, pnpm, or Yarn lockfile was found. This repo has no supported dependency snapshot; no CVE verdict was made")
+        if len(locks) > 20:
+            raise ValueError("More than 20 lockfiles found; narrow project selection is not supported yet")
         owners = None
         for owner_path in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+            if owner_path not in paths:
+                continue
             owners = await _content(client, repo, owner_path, sha)
             if owners:
                 break
-    return Snapshot(
-        repo=repo,
-        sha=sha,
-        lockfile=json.loads(lock_bytes),
-        package_json=json.loads(package_bytes) if package_bytes else {},
-        owner=_owner_from_codeowners(owners.decode("utf-8") if owners else None),
-        services=_services_from_manifest(json.loads(manifest_bytes) if manifest_bytes else None),
-        source=f"https://github.com/{repo}/tree/{sha}",
-        lockfile_text=lock_bytes.decode("utf-8"),
-    )
+        results = []
+        for folder, (filename, lock_path) in sorted(locks.items()):
+            lock_bytes = await _content(client, repo, lock_path, sha)
+            if lock_bytes is None:
+                raise ValueError(f"Lockfile disappeared at {lock_path}; retry the scan")
+            manager = {"package-lock.json": "npm", "pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn"}[filename]
+            if manager == "npm":
+                lockfile = json.loads(lock_bytes)
+                importers = ["."]
+            elif manager == "pnpm":
+                documents = list(yaml.safe_load_all(lock_bytes))
+                if not documents or not isinstance(documents[-1], dict):
+                    raise ValueError(f"Invalid pnpm lockfile at {lock_path}")
+                lockfile = documents[-1]
+                importers = list(lockfile.get("importers", {}))
+            else:
+                lockfile = {}
+                importers = ["."]
+            if len(importers) + len(results) > 30:
+                raise ValueError("More than 30 projects found; narrow project selection is not supported yet")
+            for importer in importers:
+                if importer.startswith("/") or ".." in importer.split("/"):
+                    raise ValueError(f"Invalid pnpm importer path: {importer}")
+                project_path = "/".join(part for part in (folder, importer if importer != "." else "") if part)
+                package_path = f"{project_path}/package.json" if project_path else "package.json"
+                manifest_path = f"{project_path}/blast-radius.json" if project_path else "blast-radius.json"
+                package_bytes = await _content(client, repo, package_path, sha) if package_path in paths else None
+                if manager == "yarn" and package_bytes is None:
+                    raise ValueError(f"Yarn project at {project_path or '.'} needs package.json to identify production dependencies")
+                manifest_bytes = await _content(client, repo, manifest_path, sha) if manifest_path in paths else None
+                results.append(Snapshot(
+                    repo=repo if not project_path else f"{repo}::{project_path}",
+                    sha=sha,
+                    lockfile=lockfile,
+                    package_json=json.loads(package_bytes) if package_bytes else {},
+                    owner=_owner_from_codeowners(owners.decode("utf-8") if owners else None),
+                    services=_services_from_manifest(json.loads(manifest_bytes) if manifest_bytes else None),
+                    source=f"https://github.com/{repo}/tree/{sha}" + (f"/{project_path}" if project_path else ""),
+                    lockfile_text=lock_bytes.decode("utf-8"),
+                    manager=manager,
+                    project_path=project_path,
+                    importer=importer,
+                    lockfile_path=lock_path,
+                ))
+    if not results:
+        raise ValueError("No supported projects were found in the lockfiles")
+    return results
+
+
+async def fetch_public_repo(repo: str) -> Snapshot:
+    """Return a root npm project for the current root-only draft PR workflow."""
+    projects = await fetch_public_projects(repo)
+    match = next((item for item in projects if not item.project_path and item.manager == "npm"), None)
+    if match is None:
+        raise ValueError("Automated draft PRs currently require a root npm package-lock.json")
+    return match

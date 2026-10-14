@@ -9,6 +9,8 @@ from typing import Any
 from falkordb import FalkorDB
 
 from .lockfile import edges_from_lockfile, parse_lockfile
+from .pnpm_lock import parse_pnpm_project
+from .yarn_lock import parse_yarn_project
 from .sources import Snapshot
 
 
@@ -22,15 +24,16 @@ class GraphStore:
         return True
 
     def ingest(self, snapshot: Snapshot) -> dict[str, Any]:
-        dependencies = parse_lockfile(snapshot.lockfile)
-        edges = edges_from_lockfile(snapshot.lockfile, dependencies)
+        dependencies, edges = dependency_graph(snapshot)
         repo = snapshot.repo
         # Replace only this repo's snapshot. MERGE makes each batch retry safe.
         # Decisions are durable memory; a fresh source snapshot must not erase them.
         self.graph.query("MATCH (n {repo_id:$repo}) WHERE NOT n:Decision DETACH DELETE n", {"repo": repo})
         self.graph.query(
-            "MERGE (r:Repo {id:$repo}) SET r.repo_id=$repo, r.sha=$sha, r.source=$source, r.ingested_at=$now, r.complete=true",
-            {"repo": repo, "sha": snapshot.sha, "source": snapshot.source, "now": datetime.now(timezone.utc).isoformat()},
+            "MERGE (r:Repo {id:$repo}) SET r.repo_id=$repo, r.sha=$sha, r.source=$source, "
+            "r.manager=$manager, r.project_path=$project_path, r.ingested_at=$now, r.complete=true",
+            {"repo": repo, "sha": snapshot.sha, "source": snapshot.source, "manager": snapshot.manager,
+             "project_path": snapshot.project_path, "now": datetime.now(timezone.utc).isoformat()},
         )
         self.graph.query(
             "MATCH (r:Repo {id:$repo}), (d:Decision {repo_id:$repo}) MERGE (r)-[:HAS_DECISION]->(d)",
@@ -80,8 +83,18 @@ class GraphStore:
         return {"repo": repo, "sha": snapshot.sha, "dependencies": len(rows), "edges": len(edges), "services": len(snapshot.services)}
 
     def repositories(self) -> list[dict[str, str]]:
-        rows = self.graph.ro_query("MATCH (r:Repo) RETURN r.id, r.sha, r.source ORDER BY r.id LIMIT 100", timeout=3000).result_set
-        return [{"repo": r[0], "sha": r[1], "source": r[2]} for r in rows]
+        rows = self.graph.ro_query("MATCH (r:Repo) RETURN r.id, r.sha, r.source, r.manager ORDER BY r.id LIMIT 100", timeout=3000).result_set
+        return [{"repo": r[0], "sha": r[1], "source": r[2], "manager": r[3]} for r in rows]
+
+    def prune_missing_projects(self, github_repo: str, current: set[str]) -> None:
+        """Retire lockfile projects removed from a GitHub repo's latest snapshot."""
+        for row in self.repositories():
+            project = row["repo"]
+            if (project == github_repo or project.startswith(f"{github_repo}::")) and project not in current:
+                self.graph.query(
+                    "MATCH (n {repo_id:$repo}) WHERE NOT n:Decision DETACH DELETE n",
+                    {"repo": project},
+                )
 
     def paths_to(self, repo: str, package_name: str) -> list[dict[str, Any]]:
         rows = self.graph.ro_query(
@@ -95,6 +108,9 @@ class GraphStore:
         ]
 
     def context(self, repo: str, advisory_id: str) -> dict[str, Any]:
+        repo_rows = self.graph.ro_query(
+            "MATCH (r:Repo {id:$repo}) RETURN r.manager, r.project_path LIMIT 1", {"repo": repo}, timeout=3000
+        ).result_set
         owner_rows = self.graph.ro_query(
             "MATCH (:Repo {id:$repo})-[:OWNED_BY]->(o:Owner) RETURN o.name LIMIT 1", {"repo": repo}, timeout=3000
         ).result_set
@@ -109,10 +125,13 @@ class GraphStore:
             {"repo": repo, "advisory": advisory_id}, timeout=3000,
         ).result_set
         return {
+            "manager": repo_rows[0][0] if repo_rows and repo_rows[0][0] else "npm",
+            "project_path": repo_rows[0][1] if repo_rows and repo_rows[0][1] else "",
             "owner": owner_rows[0][0] if owner_rows else None,
             "services": [{"name": row[0], "exposure": row[1], "public_route": row[2]} for row in service_rows],
             "decisions": [{"verdict": row[0], "reason": row[1], "created_at": row[2]} for row in decision_rows],
         }
+
 
     def link_advisory(self, advisory_id: str, summary: str, dependency_ids: list[str]) -> None:
         self.graph.query("MERGE (a:Advisory {id:$id}) SET a.summary=$summary", {"id": advisory_id, "summary": summary})
@@ -131,3 +150,14 @@ class GraphStore:
             "verdict:$verdict, reason:$reason, created_at:$now}) CREATE (r)-[:HAS_DECISION]->(d)",
             {"repo": repo, "advisory": advisory_id, "verdict": verdict, "reason": reason, "now": datetime.now(timezone.utc).isoformat()},
         )
+
+
+def dependency_graph(snapshot: Snapshot) -> tuple[list, list[tuple[str, str]]]:
+    if snapshot.manager == "npm":
+        dependencies = parse_lockfile(snapshot.lockfile)
+        return dependencies, edges_from_lockfile(snapshot.lockfile, dependencies)
+    if snapshot.manager == "pnpm":
+        return parse_pnpm_project(snapshot.lockfile, snapshot.importer)
+    if snapshot.manager == "yarn":
+        return parse_yarn_project(snapshot.lockfile_text or "", snapshot.package_json)
+    raise ValueError(f"Unsupported package manager: {snapshot.manager}")

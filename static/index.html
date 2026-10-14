@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f7f7f5">
+  <meta name="theme-color" content="#1c1d1c">
   <title>BlastRadius · Investigations</title>
   <link rel="stylesheet" href="/static/styles.css">
   <link rel="stylesheet" href="/static/fix.css">
@@ -23,19 +23,19 @@
     <main id="top">
       <header class="topbar">
         <div><div class="eyebrow">Security workspace</div><h1>Investigations</h1><p>Check a CVE against the latest commit of a public GitHub repository.</p></div>
-        <span class="top-tag">Public GitHub repos · npm</span>
+        <span class="top-tag">Public GitHub repos · npm / pnpm / Yarn</span>
       </header>
 
       <section class="workspace-grid" aria-label="Start an investigation">
         <div id="investigate" class="panel investigation-panel">
           <div class="panel-heading"><div><div class="panel-kicker">Live GitHub scan</div><h2>Trace a vulnerability</h2></div><span class="panel-icon" aria-hidden="true">↗</span></div>
-          <p class="muted">Paste a public repo URL and a CVE. BlastRadius reads its current default-branch lockfile, builds the graph, and returns the dependency path and available service context.</p>
+          <p class="muted">Paste a public repo URL and a CVE. BlastRadius discovers supported lockfiles at the latest commit, builds project graphs, and returns dependency paths with available service context.</p>
           <form id="investigation-form" class="form-stack">
             <label for="live-repo">Public GitHub repository</label>
             <input id="live-repo" placeholder="https://github.com/owner/repo or owner/repo" required spellcheck="false" autocomplete="off">
             <label for="advisory" class="stacked-label">CVE or GitHub advisory ID</label>
             <div class="input-row"><input id="advisory" placeholder="CVE-2024-… or GHSA-…" required spellcheck="false" autocomplete="off"><button class="primary" type="submit">Scan latest <span aria-hidden="true">→</span></button></div>
-            <p class="form-hint">Supports public npm repos with a root package-lock.json. No GitHub sign-in is needed for public repos.</p>
+            <p class="form-hint">Finds npm, pnpm v9, and Yarn Classic lockfiles, including nested projects. No GitHub sign-in needed.</p>
           </form>
         </div>
 

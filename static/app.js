@@ -39,7 +39,7 @@ async function refresh() {
     $('repo-list').innerHTML = repos.length
       ? repos.map(r => r.repo.startsWith('demo/')
         ? `<div class="repo-pill demo" title="Synthetic fixture">${escapeHtml(r.repo)}</div>`
-        : `<button class="repo-pill" type="button" data-repo="${escapeHtml(r.repo)}" title="Scan latest commit of ${escapeHtml(r.repo)}">${escapeHtml(r.repo)}</button>`).join('')
+        : `<button class="repo-pill" type="button" data-repo="${escapeHtml(r.repo.split('::')[0])}" title="Scan latest commit of ${escapeHtml(r.repo)}">${escapeHtml(r.repo)}${r.manager ? ` · ${escapeHtml(r.manager)}` : ''}</button>`).join('')
       : '<div class="empty-small">No repositories imported yet.</div>';
   } catch (error) {
     $('connection-dot').className = 'dot bad';
@@ -63,7 +63,7 @@ function resultHtml(result) {
     ? result.fix_candidates.map(f => `${escapeHtml(f.package)} → ${escapeHtml(f.first_patched)}${f.direct ? ' (direct)' : ' (transitive; verify parent range)'}`).join(', ')
     : 'No verified patch candidate in advisory';
   const direct = result.fix_candidates.find(f => f.direct);
-  const action = direct && !result.repo.startsWith('demo/')
+  const action = direct && result.fix_supported && !result.repo.startsWith('demo/')
     ? `<button class="secondary fix-action" data-fix-repo="${escapeHtml(result.repo)}" data-fix-package="${escapeHtml(direct.package)}">Review proposed fix →</button>`
     : '';
   const decisionAction = result.vulnerable_paths.length
@@ -87,7 +87,7 @@ function renderResults(data) {
   $('results-summary').textContent = data.advisory.summary;
   $('results-severity').textContent = data.advisory.severity;
   $('results-source').textContent = data.source
-    ? `${data.source.repo} · latest commit ${data.source.sha.slice(0, 10)} · ${data.source.dependencies} dependencies · ${new Date(data.source.scanned_at).toLocaleString()}`
+    ? `${data.source.repo} · latest commit ${data.source.sha.slice(0, 10)} · ${data.source.projects} ${data.source.projects === 1 ? 'project' : 'projects'} · ${data.source.dependencies} dependencies · ${new Date(data.source.scanned_at).toLocaleString()}`
     : 'Synthetic incident · stored graph snapshot';
   $('results').innerHTML = data.results.map(resultHtml).join('');
   $('results-section').scrollIntoView({behavior:'smooth', block:'start'});

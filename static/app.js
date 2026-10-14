@@ -37,7 +37,9 @@ async function refresh() {
     $('connection-label').textContent = ok ? 'FalkorDB connected' : 'FalkorDB unavailable';
     $('repo-count').textContent = `${repos.length} ${repos.length === 1 ? 'repo' : 'repos'}`;
     $('repo-list').innerHTML = repos.length
-      ? repos.map(r => `<div class="repo-pill ${r.repo.startsWith('demo/') ? 'demo' : ''}" title="${escapeHtml(r.source)} · ${escapeHtml(r.sha)}">${escapeHtml(r.repo)}</div>`).join('')
+      ? repos.map(r => r.repo.startsWith('demo/')
+        ? `<div class="repo-pill demo" title="Synthetic fixture">${escapeHtml(r.repo)}</div>`
+        : `<button class="repo-pill" type="button" data-repo="${escapeHtml(r.repo)}" title="Scan latest commit of ${escapeHtml(r.repo)}">${escapeHtml(r.repo)}</button>`).join('')
       : '<div class="empty-small">No repositories imported yet.</div>';
   } catch (error) {
     $('connection-dot').className = 'dot bad';
@@ -78,22 +80,30 @@ function resultHtml(result) {
   </article>`;
 }
 
+function renderResults(data) {
+  currentAdvisory = data.advisory.id;
+  $('results-section').classList.remove('hidden');
+  $('results-title').textContent = data.advisory.id;
+  $('results-summary').textContent = data.advisory.summary;
+  $('results-severity').textContent = data.advisory.severity;
+  $('results-source').textContent = data.source
+    ? `${data.source.repo} · latest commit ${data.source.sha.slice(0, 10)} · ${data.source.dependencies} dependencies · ${new Date(data.source.scanned_at).toLocaleString()}`
+    : 'Synthetic incident · stored graph snapshot';
+  $('results').innerHTML = data.results.map(resultHtml).join('');
+  $('results-section').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
 $('investigation-form').addEventListener('submit', async event => {
   event.preventDefault();
   const button = event.target.querySelector('button');
   button.disabled = true;
-  button.textContent = 'Tracing…';
+  button.textContent = 'Scanning…';
   try {
-    const data = await api('/api/investigate', {method:'POST', body:JSON.stringify({advisory:$('advisory').value})});
-    currentAdvisory = data.advisory.id;
-    $('results-section').classList.remove('hidden');
-    $('results-title').textContent = data.advisory.id;
-    $('results-summary').textContent = data.advisory.summary;
-    $('results-severity').textContent = data.advisory.severity;
-    $('results').innerHTML = data.results.map(resultHtml).join('');
-    $('results-section').scrollIntoView({behavior:'smooth', block:'start'});
+    const data = await api('/api/scan/live', {method:'POST', body:JSON.stringify({repo:$('live-repo').value, advisory:$('advisory').value})});
+    renderResults(data);
+    await refresh();
   } catch (error) { notice(error.message, true); }
-  finally { button.disabled = false; button.innerHTML = 'Investigate <span aria-hidden="true">→</span>'; }
+  finally { button.disabled = false; button.innerHTML = 'Scan latest <span aria-hidden="true">→</span>'; }
 });
 
 $('seed-demo').addEventListener('click', async event => {
@@ -102,26 +112,20 @@ $('seed-demo').addEventListener('click', async event => {
   button.textContent = 'Loading…';
   try {
     const data = await api('/api/demo/seed', {method:'POST'});
+    const investigation = await api('/api/investigate', {method:'POST', body:JSON.stringify({advisory:'DEMO-2026-001', demo_only:true})});
+    renderResults(investigation);
     notice(`Loaded ${data.ingested.length} synthetic repositories into FalkorDB`);
     await refresh();
   } catch (error) { notice(error.message, true); }
-  finally { button.disabled = false; button.textContent = 'Load sample data'; }
+  finally { button.disabled = false; button.textContent = 'Run sample investigation'; }
 });
 
-$('toggle-connect').addEventListener('click', () => $('connect-form').classList.toggle('hidden'));
-$('connect-form').addEventListener('submit', async event => {
-  event.preventDefault();
-  const button = event.target.querySelector('button');
-  button.disabled = true;
-  button.textContent = 'Importing…';
-  try {
-    const data = await api('/api/repos/ingest', {method:'POST', body:JSON.stringify({repo:$('repo-input').value})});
-    notice(`Imported ${data.repo}: ${data.dependencies} dependencies`);
-    $('repo-input').value = '';
-    $('connect-form').classList.add('hidden');
-    await refresh();
-  } catch (error) { notice(error.message, true); }
-  finally { button.disabled = false; button.textContent = 'Import'; }
+$('repo-list').addEventListener('click', event => {
+  const button = event.target.closest('[data-repo]');
+  if (!button) return;
+  $('live-repo').value = button.dataset.repo;
+  $('advisory').focus();
+  $('investigate').scrollIntoView({behavior:'smooth', block:'start'});
 });
 
 $('results').addEventListener('click', async event => {

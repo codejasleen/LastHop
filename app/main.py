@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +30,12 @@ class IngestRequest(BaseModel):
 class InvestigationRequest(BaseModel):
     advisory: str = Field(min_length=8, max_length=30)
     repo: str | None = None
+    demo_only: bool = False
+
+
+class LiveScanRequest(BaseModel):
+    repo: str = Field(min_length=3, max_length=200)
+    advisory: str = Field(min_length=8, max_length=30)
 
 
 class DecisionRequest(BaseModel):
@@ -172,7 +180,11 @@ async def investigate(request: InvestigationRequest) -> dict:
             raise ValueError("This advisory has no npm package mapping, so a dependency verdict is unavailable")
         graph = store()
         repos = graph.repositories()
-        selected = [r["repo"] for r in repos if request.repo is None or r["repo"] == request.repo]
+        selected = [
+            r["repo"] for r in repos
+            if (request.repo is None or r["repo"] == request.repo)
+            and (not request.demo_only or r["repo"].startswith("demo/"))
+        ]
         if not selected:
             raise HTTPException(404, "No matching repository has been ingested")
         results = [investigate_one(graph, repo, advisory) for repo in selected]
@@ -188,6 +200,36 @@ async def investigate(request: InvestigationRequest) -> dict:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(502, f"Investigation failed: {exc.__class__.__name__}: {exc}") from exc
+
+
+@app.post("/api/scan/live")
+async def scan_live(request: LiveScanRequest) -> dict:
+    """Fetch a public repo's current default-branch commit and investigate a CVE."""
+    try:
+        advisory = await fetch_advisory(request.advisory)
+        if not advisory.packages:
+            raise ValueError("This advisory has no npm package mapping, so a dependency verdict is unavailable")
+        snapshot = await fetch_public_repo(request.repo)
+        graph = store()
+        imported = graph.ingest(snapshot)
+        result = investigate_one(graph, snapshot.repo, advisory)
+        return {
+            "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url},
+            "results": [result],
+            "source": {"repo": snapshot.repo, "sha": snapshot.sha, "url": snapshot.source, "scanned_at": datetime.now(timezone.utc).isoformat(), "dependencies": imported["dependencies"]},
+        }
+    except HTTPException:
+        raise
+    except (ValueError, LookupError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            raise HTTPException(404, "GitHub repository or advisory was not found") from exc
+        raise HTTPException(502, f"GitHub returned HTTP {exc.response.status_code}") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(502, "GitHub is unreachable; try again shortly") from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Live scan failed: {exc.__class__.__name__}") from exc
 
 
 @app.post("/api/decisions")

@@ -19,10 +19,11 @@ python -m venv .venv
 
 Open <http://127.0.0.1:8000>. Or run the whole stack with `docker compose up` (the app container installs Python requirements on startup). The FalkorDB Browser is at <http://127.0.0.1:3000>.
 
-1. Click **Load sample data**.
-2. Leave `DEMO-2026-001` in the advisory field and click **Investigate**.
-3. See an exposed storefront reached through `web-framework → render-kit`, an affected internal service, and a repo where the package is absent.
-4. For live input, click **Connect repository**, enter a public GitHub `owner/repo` with a root `package-lock.json`, then enter a real npm CVE or GHSA. `axios/axios` is a tested import example; `CVE-2022-24999` is a tested real advisory lookup.
+1. Paste a public GitHub repository URL (or `owner/repo`) and enter a CVE or GHSA, then click **Scan latest**. Each scan fetches the current default-branch commit before rebuilding that repo's graph snapshot.
+2. For a tested real example, use `axios/axios` and `CVE-2022-24999`. The result correctly reports that the affected `qs` package is absent from that repo's production dependency snapshot.
+3. Click **Run sample investigation** for a clearly synthetic affected case: a public storefront reached through `web-framework → render-kit`, an affected internal service, and a repo where the package is absent.
+
+This works with arbitrary **public npm repositories that have a root `package-lock.json` v2/v3**. It does not yet inspect private repos, other ecosystems, nested monorepo lockfiles, or function-level call paths. A public GitHub repo needs no sign-in; optional `GITHUB_TOKEN` can raise GitHub API limits and is required for draft PR creation.
 
 Run the focused checks with `.\.venv\Scripts\python.exe -m pytest -q`.
 
@@ -53,7 +54,7 @@ The app reports **package not present**, **version unaffected**, **affected with
 
 ## Public repo evidence
 
-The importer reads the default branch SHA, root `package.json` and `package-lock.json`, optional `CODEOWNERS`, and optional `blast-radius.json` through the GitHub API. It refuses private repos. A manifest can declare service exposure:
+The live scan reads the default branch SHA, root `package.json` and `package-lock.json`, optional `CODEOWNERS`, and optional `blast-radius.json` through the GitHub API. It refuses private repos. The UI shows the exact commit SHA it scanned. A manifest can declare service exposure:
 
 ```json
 {
@@ -64,7 +65,7 @@ The importer reads the default branch SHA, root `package.json` and `package-lock
 }
 ```
 
-Without this evidence, exposure is **unknown**. A signed GitHub `push` webhook sent to `/api/webhooks/github` refreshes an already-connected public repo when its default branch changes; set `GITHUB_WEBHOOK_SECRET` before enabling it. The webhook does not create PRs.
+Without this evidence, exposure is **unknown**. Pressing **Scan latest** always refreshes the repository. A signed GitHub `push` webhook sent to `/api/webhooks/github` can also refresh an already-scanned public repo when its default branch changes; set `GITHUB_WEBHOOK_SECRET` and expose a secured webhook URL before enabling it. The webhook does not create PRs.
 
 ## Draft PR gate
 
@@ -75,8 +76,8 @@ Keep credentials in your local environment or an untracked `.env`; never commit 
 ## Demo script (2 minutes)
 
 1. **The problem (15s):** A package advisory alone cannot answer whether a vulnerable version reaches a public service.
-2. **Live graph (45s):** Seed the synthetic incident, run `DEMO-2026-001`, and follow the storefront's dependency path and public route. Compare its result to the internal service and absent package.
-3. **Real input (35s):** Import `axios/axios`, investigate real `CVE-2022-24999`, and show the graph reports the package is not present in its production dependency snapshot.
+2. **Live graph (45s):** Run the synthetic incident and follow the storefront's dependency path and public route. Compare its result to the internal service and absent package.
+3. **Real input (35s):** Paste `https://github.com/axios/axios` and real `CVE-2022-24999`, scan the latest commit, and show the graph reports the package is not present in its production dependency snapshot.
 4. **Action (25s):** Explain the reviewable direct-dependency lockfile diff and approval-gated draft PR. Show a configured test repo if GitHub write credentials are available; otherwise state that the write gate requires them.
 
 The result is strongest when the judge sees the same advisory lead to different evidence-backed actions. The demo never presents synthetic data as a live incident.

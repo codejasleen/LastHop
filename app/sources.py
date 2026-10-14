@@ -7,11 +7,27 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 
 REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def normalize_repo(repo: str) -> str:
+    """Accept an owner/name slug or a GitHub repository URL."""
+    repo = repo.strip()
+    if repo.startswith("https://"):
+        parsed = urlparse(repo)
+        if parsed.netloc.lower() != "github.com" or parsed.username or parsed.password:
+            raise ValueError("Enter a public github.com repository URL or owner/name")
+        repo = parsed.path.strip("/")
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+    if not REPO_SLUG.fullmatch(repo):
+        raise ValueError("Repository must be owner/name or https://github.com/owner/name")
+    return repo
 
 
 @dataclass(frozen=True)
@@ -81,9 +97,7 @@ def _services_from_manifest(data: dict[str, Any] | None) -> list[dict[str, Any]]
 async def fetch_public_repo(repo: str) -> Snapshot:
     import json
 
-    repo = repo.strip()
-    if not REPO_SLUG.fullmatch(repo):
-        raise ValueError("Repository must be owner/name")
+    repo = normalize_repo(repo)
     async with httpx.AsyncClient(timeout=15, headers=_headers(), follow_redirects=False) as client:
         metadata = await client.get(f"https://api.github.com/repos/{repo}")
         metadata.raise_for_status()

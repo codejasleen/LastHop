@@ -19,10 +19,10 @@ python -m venv .venv
 
 Open <http://127.0.0.1:8000>. Or run the whole stack with `docker compose up` (the app container installs Python requirements on startup). The FalkorDB Browser is at <http://127.0.0.1:3000>.
 
-1. Click **Load demo graph**.
-2. Leave `DEMO-2026-001` in the advisory field and click **Trace impact**.
+1. Click **Load sample data**.
+2. Leave `DEMO-2026-001` in the advisory field and click **Investigate**.
 3. See an exposed storefront reached through `web-framework → render-kit`, an affected internal service, and a repo where the package is absent.
-4. For live input, click **Connect public repo**, enter a GitHub `owner/repo` with a root `package-lock.json`, then enter a real npm CVE or GHSA. `axios/axios` is a tested import example; `CVE-2022-24999` is a tested real advisory lookup.
+4. For live input, click **Connect repository**, enter a public GitHub `owner/repo` with a root `package-lock.json`, then enter a real npm CVE or GHSA. `axios/axios` is a tested import example; `CVE-2022-24999` is a tested real advisory lookup.
 
 Run the focused checks with `.\.venv\Scripts\python.exe -m pytest -q`.
 

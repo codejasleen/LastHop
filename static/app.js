@@ -35,10 +35,10 @@ async function refresh() {
     const ok = health.database === 'connected';
     $('connection-dot').className = `dot ${ok ? 'ok' : 'bad'}`;
     $('connection-label').textContent = ok ? 'FalkorDB connected' : 'FalkorDB unavailable';
-    $('repo-count').textContent = `${repos.length} ${repos.length === 1 ? 'REPO' : 'REPOS'}`;
+    $('repo-count').textContent = `${repos.length} ${repos.length === 1 ? 'repo' : 'repos'}`;
     $('repo-list').innerHTML = repos.length
-      ? repos.map(r => `<div class="repo-pill" title="${escapeHtml(r.sha)}">${escapeHtml(r.repo)}</div>`).join('')
-      : '<div class="empty-small">No repositories ingested yet.</div>';
+      ? repos.map(r => `<div class="repo-pill ${r.repo.startsWith('demo/') ? 'demo' : ''}" title="${escapeHtml(r.source)} · ${escapeHtml(r.sha)}">${escapeHtml(r.repo)}</div>`).join('')
+      : '<div class="empty-small">No repositories imported yet.</div>';
   } catch (error) {
     $('connection-dot').className = 'dot bad';
     $('connection-label').textContent = 'FalkorDB unavailable';
@@ -68,12 +68,12 @@ function resultHtml(result) {
     ? `<button class="ghost decision-action" data-decision-repo="${escapeHtml(result.repo)}">Record decision</button>`
     : '';
   const priorDecision = result.prior_decisions.length
-    ? `<div class="decision-memory"><div class="evidence-label">LAST RECORDED DECISION</div><strong>${escapeHtml(result.prior_decisions[0].verdict)}</strong> · ${escapeHtml(result.prior_decisions[0].reason)}</div>`
+    ? `<div class="decision-memory"><div class="evidence-label">Last recorded decision</div><strong>${escapeHtml(result.prior_decisions[0].verdict)}</strong> · ${escapeHtml(result.prior_decisions[0].reason)}</div>`
     : '';
   return `<article class="result-card ${escapeHtml(result.verdict)}">
     <div class="result-head"><h3>${escapeHtml(result.repo)}</h3><span class="badge">${escapeHtml(labels[result.verdict] || result.verdict)}</span></div>
     <p class="result-explanation">${escapeHtml(result.explanation)}</p>
-    <div class="evidence"><div class="evidence-box"><div class="evidence-label">DEPENDENCY PATH · FALKORDB</div>${paths}</div><div class="evidence-box"><div class="evidence-label">DEPLOYMENT EVIDENCE</div>${services}</div></div>
+    <div class="evidence"><div class="evidence-box"><div class="evidence-label">Dependency path · FalkorDB</div>${paths}</div><div class="evidence-box"><div class="evidence-label">Deployment evidence</div>${services}</div></div>
     <div class="result-foot"><span>Owner <strong>${escapeHtml(result.owner || 'unknown')}</strong></span><span>Fix <strong>${fix}</strong></span><span>Prior decisions <strong>${result.prior_decisions.length}</strong></span></div>${priorDecision}${action}${decisionAction}
   </article>`;
 }
@@ -93,7 +93,7 @@ $('investigation-form').addEventListener('submit', async event => {
     $('results').innerHTML = data.results.map(resultHtml).join('');
     $('results-section').scrollIntoView({behavior:'smooth', block:'start'});
   } catch (error) { notice(error.message, true); }
-  finally { button.disabled = false; button.innerHTML = 'Trace impact <span>→</span>'; }
+  finally { button.disabled = false; button.innerHTML = 'Investigate <span aria-hidden="true">→</span>'; }
 });
 
 $('seed-demo').addEventListener('click', async event => {
@@ -105,7 +105,7 @@ $('seed-demo').addEventListener('click', async event => {
     notice(`Loaded ${data.ingested.length} synthetic repositories into FalkorDB`);
     await refresh();
   } catch (error) { notice(error.message, true); }
-  finally { button.disabled = false; button.textContent = 'Load demo graph'; }
+  finally { button.disabled = false; button.textContent = 'Load sample data'; }
 });
 
 $('toggle-connect').addEventListener('click', () => $('connect-form').classList.toggle('hidden'));

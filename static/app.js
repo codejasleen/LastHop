@@ -60,12 +60,26 @@ function resultHtml(result) {
     ? result.services.map(s => `<div class="detail"><strong>${escapeHtml(s.name)}</strong> · ${escapeHtml(s.exposure)}${s.public_route ? `<br>${escapeHtml(s.public_route)}` : ''}</div>`).join('')
     : '<div class="detail">No deployment evidence supplied. Exposure is unknown.</div>';
   const fix = result.fix_candidates.length
-    ? result.fix_candidates.map(f => `${escapeHtml(f.package)} → ${escapeHtml(f.first_patched)}${f.direct ? ' (direct)' : ' (transitive; verify parent range)'}`).join(', ')
+    ? result.fix_candidates.map(f => f.strategy === 'lockfile_refresh'
+      ? `Lockfile refresh: ${escapeHtml(f.package)} → ${escapeHtml(f.target)} fits ${escapeHtml(f.parent_name)} ${escapeHtml(f.declared_range)}`
+      : `${escapeHtml(f.package)} → ${escapeHtml(f.first_patched)} (review parent range)`).join(', ')
     : 'No verified patch candidate in advisory';
-  const direct = result.fix_candidates.find(f => f.direct);
-  const action = direct && result.fix_supported && !result.repo.startsWith('demo/')
-    ? `<button class="secondary fix-action" data-fix-repo="${escapeHtml(result.repo)}" data-fix-package="${escapeHtml(direct.package)}">Review proposed fix →</button>`
+  const fixable = result.fix_candidates.find(f => f.strategy === 'lockfile_refresh');
+  const action = fixable && result.fix_supported && !result.repo.startsWith('demo/')
+    ? `<button class="secondary fix-action" data-fix-repo="${escapeHtml(result.repo)}" data-fix-package="${escapeHtml(fixable.package)}">Review lockfile fix →</button>`
     : '';
+  const moduleEvidence = (result.module_evidence || []).map(e => {
+    if (e.status === 'unavailable') return `<div class="detail">${escapeHtml(e.parent)}: source inspection unavailable.</div>`;
+    const meaning = e.status === 'runtime_static_path' ? 'Static import path from package main found'
+      : e.status === 'cli_only_static_path' ? 'Static import observed in CLI; no path found from package main'
+      : 'No static import path found from package main or CLI';
+    const sourceLink = e.file
+      ? `https://unpkg.com/${encodeURIComponent(e.parent)}@${encodeURIComponent(e.parent_version)}/${e.file.split('/').map(encodeURIComponent).join('/')}`
+      : '';
+    return `<div class="detail"><strong>${escapeHtml(e.parent)}@${escapeHtml(e.parent_version)}</strong> · ${meaning}<br>
+      Main: <code>${escapeHtml(e.main)}</code>${e.file ? ` · Import: <a href="${escapeHtml(sourceLink)}" target="_blank" rel="noopener noreferrer"><code>${escapeHtml(e.file)}:${escapeHtml(e.line)}</code></a>` : ''}<br>
+      <span class="evidence-caveat">${escapeHtml(e.scope)}</span></div>`;
+  }).join('') || '<div class="detail">No package module trace is available for this result.</div>';
   const decisionAction = result.vulnerable_paths.length
     ? `<button class="ghost decision-action" data-decision-repo="${escapeHtml(result.repo)}">Record decision</button>`
     : '';
@@ -73,9 +87,9 @@ function resultHtml(result) {
     ? `<div class="decision-memory"><div class="evidence-label">Last recorded decision</div><strong>${escapeHtml(result.prior_decisions[0].verdict)}</strong> · ${escapeHtml(result.prior_decisions[0].reason)}</div>`
     : '';
   return `<article class="result-card ${escapeHtml(result.verdict)}">
-    <div class="result-head"><h3>${escapeHtml(result.repo)}</h3><span class="badge">${escapeHtml(labels[result.verdict] || result.verdict)}</span></div>
+    <div class="result-head"><h3>${escapeHtml(result.repo)}</h3><span class="badge">${escapeHtml(result.priority || 'Review')}${result.priority?.startsWith('P') ? ' provisional' : ''} · ${escapeHtml(labels[result.verdict] || result.verdict)}</span></div>
     <p class="result-explanation">${escapeHtml(result.explanation)}</p>
-    <div class="evidence"><div class="evidence-box"><div class="evidence-label">Dependency path · FalkorDB</div>${paths}</div><div class="evidence-box"><div class="evidence-label">Deployment evidence</div>${services}</div></div>
+    <div class="evidence"><div class="evidence-box"><div class="evidence-label">Dependency path · FalkorDB</div>${paths}</div><div class="evidence-box"><div class="evidence-label">Module entry evidence · FalkorDB</div>${moduleEvidence}</div><div class="evidence-box"><div class="evidence-label">Deployment evidence</div>${services}</div></div>
     <div class="result-foot"><span>Owner <strong>${escapeHtml(result.owner || 'unknown')}</strong></span><span>Fix <strong>${fix}</strong></span><span>Prior decisions <strong>${result.prior_decisions.length}</strong></span></div>${priorDecision}${action}${decisionAction}
   </article>`;
 }
@@ -85,7 +99,7 @@ function renderResults(data) {
   $('results-section').classList.remove('hidden');
   $('results-title').textContent = data.advisory.id;
   $('results-summary').textContent = data.advisory.summary;
-  $('results-severity').textContent = data.advisory.severity;
+  $('results-severity').textContent = `Advisory severity: ${data.advisory.severity}`;
   $('results-source').textContent = data.source
     ? `${data.source.repo} · latest commit ${data.source.sha.slice(0, 10)} · ${data.source.projects} ${data.source.projects === 1 ? 'project' : 'projects'} · ${data.source.dependencies} dependencies · ${new Date(data.source.scanned_at).toLocaleString()}`
     : 'Synthetic incident · stored graph snapshot';
@@ -152,7 +166,7 @@ $('results').addEventListener('click', async event => {
     $('fix-diff').textContent = currentProposal.diff + (currentProposal.truncated ? '\n… diff display truncated; full change will be committed.' : '');
     $('fix-modal').classList.remove('hidden');
   } catch (error) { notice(error.message, true); }
-  finally { button.disabled = false; button.textContent = 'Review proposed fix →'; }
+  finally { button.disabled = false; button.textContent = 'Review lockfile fix →'; }
 });
 $('close-decision').addEventListener('click', () => $('decision-modal').classList.add('hidden'));
 $('decision-form').addEventListener('submit', async event => {

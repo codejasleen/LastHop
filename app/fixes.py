@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import difflib
+import copy
 import json
 import os
 import secrets
-import shutil
-import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -20,7 +18,6 @@ from .lockfile import parse_lockfile
 from .sources import Snapshot, fetch_public_repo
 
 
-ROOT = Path(__file__).resolve().parent.parent
 PROPOSALS: dict[str, "Proposal"] = {}
 
 
@@ -38,13 +35,24 @@ class Proposal:
     expires_at: float
 
 
-def _direct_dependency(snapshot: Snapshot, name: str) -> tuple[str, str]:
-    root = snapshot.lockfile["packages"][""]
-    declared = root.get("dependencies", {}).get(name)
-    installed = snapshot.lockfile["packages"].get(f"node_modules/{name}", {}).get("version")
-    if not declared or not installed:
-        raise ValueError("Automated fixes currently support direct production dependencies only")
-    return declared, installed
+def lockfile_refresh_plan(snapshot: Snapshot, advisory: Advisory, name: str) -> dict:
+    """Prove the patched version fits the immediate parent's declared range."""
+    if snapshot.manager != "npm" or snapshot.project_path:
+        raise ValueError("Automated lockfile refresh currently requires a root npm project")
+    matches = [d for d in parse_lockfile(snapshot.lockfile) if d.name == name
+               and any(p.name == name and is_affected(d.version, p.vulnerable_range) is True for p in advisory.packages)]
+    if len(matches) != 1:
+        raise ValueError("A lockfile refresh needs exactly one affected installed package instance")
+    dep = matches[0]
+    parent = snapshot.lockfile["packages"][dep.parent_path or ""]
+    declared = parent.get("dependencies", {}).get(name) or parent.get("optionalDependencies", {}).get(name)
+    if not declared:
+        raise ValueError("The parent has no production dependency declaration for this package")
+    target = _safe_target(advisory, name, dep.version)
+    fits = is_affected(target, declared)
+    return {"package": name, "before": dep.version, "target": target, "dependency_path": dep.path, "parent": dep.parent_path or "",
+            "parent_name": dep.parent_path.rsplit("node_modules/", 1)[-1] if dep.parent_path else "repo",
+            "declared_range": declared, "direct": dep.direct, "strategy": "lockfile_refresh" if fits is True else "parent_upgrade_needed"}
 
 
 def _safe_target(advisory: Advisory, name: str, installed: str) -> str:
@@ -57,38 +65,57 @@ def _safe_target(advisory: Advisory, name: str, installed: str) -> str:
     return patched[0]
 
 
-def build_preview(snapshot: Snapshot, advisory: Advisory, package: str, path: list[str]) -> tuple[str, dict]:
+async def build_preview(snapshot: Snapshot, advisory: Advisory, package: str, path: list[str]) -> tuple[str, dict]:
     if snapshot.repo.startswith("demo/"):
         raise ValueError("Synthetic demo repos cannot receive real pull requests")
-    declared, installed = _direct_dependency(snapshot, package)
-    target = _safe_target(advisory, package, installed)
-    if is_affected(target, declared) is not True:
-        raise ValueError(f"First patched version {target} falls outside the declared range {declared}; manual review is needed")
-    npm = shutil.which("npm")
-    if not npm:
-        raise ValueError("npm is required on the server to prepare a lockfile fix")
-    npm_cache = ROOT / "work" / "npm-cache"
-    npm_cache.mkdir(exist_ok=True)
+    plan = lockfile_refresh_plan(snapshot, advisory, package)
+    installed, target = plan["before"], plan["target"]
+    if plan["strategy"] != "lockfile_refresh":
+        raise ValueError(f"First patched version {target} falls outside {plan['parent_name']}'s declared range {plan['declared_range']}; review a parent upgrade")
     original = snapshot.lockfile_text or json.dumps(snapshot.lockfile, indent=2, ensure_ascii=False) + "\n"
-    with tempfile.TemporaryDirectory(prefix="blastradius-", dir=ROOT / "work") as tmp:
-        folder = Path(tmp)
-        (folder / "package.json").write_text(json.dumps(snapshot.package_json, indent=2) + "\n", encoding="utf-8")
-        (folder / "package-lock.json").write_text(original, encoding="utf-8")
-        result = subprocess.run(
-            [npm, "update", package, "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", str(npm_cache)],
-            cwd=folder, capture_output=True, text=True, timeout=90, check=False,
-        )
-        if result.returncode:
-            raise ValueError(f"npm could not prepare the lockfile: {result.stderr[-300:]}")
-        updated_text = (folder / "package-lock.json").read_text(encoding="utf-8")
-        updated_package = json.loads((folder / "package.json").read_text(encoding="utf-8"))
-    if updated_package != snapshot.package_json:
-        raise ValueError("npm changed package.json; this fix needs manual review")
-    updated = json.loads(updated_text)
+    registry_url = f"https://registry.npmjs.org/{quote(package, safe='')}/{quote(target, safe='')}"
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+        response = await client.get(registry_url)
+        response.raise_for_status()
+        metadata = response.json()
+    if metadata.get("name") != package or metadata.get("version") != target:
+        raise ValueError("Registry metadata does not match the proposed package and version")
+    dist = metadata.get("dist", {})
+    resolved, integrity = dist.get("tarball"), dist.get("integrity")
+    parsed = urlparse(resolved or "")
+    if parsed.scheme != "https" or parsed.hostname != "registry.npmjs.org" or not integrity:
+        raise ValueError("Registry did not provide a verified public npm tarball")
+    updated = copy.deepcopy(snapshot.lockfile)
+    current = updated["packages"][plan["dependency_path"]]
+    for field in ("dependencies", "optionalDependencies", "peerDependencies"):
+        if (current.get(field) or {}) != (metadata.get(field) or {}):
+            raise ValueError(f"Patched package changes {field}; review an npm-generated upgrade")
+    current.update({"version": target, "resolved": resolved, "integrity": integrity})
+    legacy = updated.get("dependencies")
+    if isinstance(legacy, dict):
+        found = []
+        def visit(entries: dict) -> None:
+            for name, entry in entries.items():
+                if not isinstance(entry, dict):
+                    continue
+                if name == package and entry.get("version") == installed:
+                    found.append(entry)
+                if isinstance(entry.get("dependencies"), dict):
+                    visit(entry["dependencies"])
+        visit(legacy)
+        if len(found) != 1:
+            raise ValueError("Legacy lockfile section does not identify exactly one matching package")
+        if (found[0].get("requires") or {}) != (metadata.get("dependencies") or {}):
+            raise ValueError("Patched package changes dependencies; review an npm-generated upgrade")
+        found[0].update({"version": target, "resolved": resolved, "integrity": integrity})
+    indent = 4 if '\n    "name"' in original[:200] else 2
+    updated_text = json.dumps(updated, indent=indent, ensure_ascii=False) + "\n"
     parse_lockfile(updated)
-    after = updated["packages"].get(f"node_modules/{package}", {}).get("version")
-    if not after or any(is_affected(after, p.vulnerable_range) is not False for p in advisory.packages if p.name == package):
-        raise ValueError("npm did not resolve the direct dependency to a verified unaffected version")
+    remaining = [d for d in parse_lockfile(updated) if d.name == package]
+    if not remaining or any(is_affected(d.version, p.vulnerable_range) is not False
+                            for d in remaining for p in advisory.packages if p.name == package):
+        raise ValueError("npm did not resolve every installed instance to a verified unaffected version")
+    after = next((d.version for d in remaining if d.path == plan["dependency_path"]), remaining[0].version)
     if updated_text == original:
         raise ValueError("npm produced no lockfile change")
     diff_lines = list(difflib.unified_diff(original.splitlines(), updated_text.splitlines(), fromfile="a/package-lock.json", tofile="b/package-lock.json", lineterm=""))
@@ -96,7 +123,9 @@ def build_preview(snapshot: Snapshot, advisory: Advisory, package: str, path: li
         raise ValueError("The lockfile change is too large for the reviewable fix preview")
     preview_id = secrets.token_urlsafe(24)
     PROPOSALS[preview_id] = Proposal(snapshot.repo, snapshot.sha, advisory.identifier, advisory.url, package, installed, after, updated_text, path, time.time() + 1800)
-    return preview_id, {"repo": snapshot.repo, "package": package, "before": installed, "after": after, "diff": "\n".join(diff_lines), "truncated": False, "proposal_id": preview_id}
+    return preview_id, {"repo": snapshot.repo, "package": package, "before": installed, "after": after,
+                        "strategy": "lockfile_refresh", "parent": plan["parent_name"], "declared_range": plan["declared_range"],
+                        "diff": "\n".join(diff_lines), "truncated": False, "proposal_id": preview_id}
 
 
 async def create_draft_pr(proposal_id: str, admin_key: str) -> str:

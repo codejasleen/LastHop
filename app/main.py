@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import tarfile
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -13,7 +14,8 @@ from pydantic import BaseModel, Field
 
 from .advisories import Advisory, fetch_advisory, is_affected
 from .graph import GraphStore, dependency_graph
-from .fixes import build_preview, create_draft_pr
+from .fixes import build_preview, create_draft_pr, lockfile_refresh_plan
+from .module_trace import fetch_parent_trace
 from .sources import fetch_public_projects, fetch_public_repo
 from .webhooks import verify_push
 
@@ -183,6 +185,44 @@ def investigate_one(graph: GraphStore, repo: str, advisory: Advisory) -> dict:
     }
 
 
+async def enrich_live_result(graph: GraphStore, snapshot, advisory: Advisory, result: dict) -> None:
+    """Attach bounded source evidence and a checked fix plan to a live result."""
+    result["module_evidence"] = []
+    result["priority"] = "Review"
+    if snapshot.manager != "npm" or not result["vulnerable_paths"]:
+        return
+    dependencies, edges = dependency_graph(snapshot)
+    by_path = {dep.path: dep for dep in dependencies}
+    for candidate in result["fix_candidates"]:
+        try:
+            candidate.update(lockfile_refresh_plan(snapshot, advisory, candidate["package"]))
+        except ValueError:
+            candidate["strategy"] = "manual_review"
+    analyzed = set()
+    for vulnerable in result["vulnerable_paths"][:3]:
+        target_path = vulnerable["dependency_id"].removeprefix(snapshot.repo + ":")
+        for parent_path, child_path in edges:
+            if child_path != target_path or not parent_path or (parent_path, target_path) in analyzed:
+                continue
+            analyzed.add((parent_path, target_path))
+            if parent_path not in by_path:
+                continue
+            try:
+                trace = await fetch_parent_trace(snapshot, parent_path, target_path, vulnerable["package"])
+                graph.save_module_trace(snapshot.repo, trace)
+                evidence = graph.module_evidence(snapshot.repo, parent_path, target_path)
+                if evidence:
+                    result["module_evidence"].append(evidence)
+            except (ValueError, httpx.HTTPError, OSError, KeyError, tarfile.TarError):
+                result["module_evidence"].append({"status": "unavailable", "parent": by_path[parent_path].name,
+                                                  "scope": "Package source could not be inspected; no module-level conclusion was made."})
+    statuses = {row["status"] for row in result["module_evidence"]}
+    if "runtime_static_path" in statuses:
+        result["priority"] = "P1" if result["verdict"] == "affected_exposed" else "P2"
+    elif "cli_only_static_path" in statuses:
+        result["priority"] = "P3"
+
+
 @app.post("/api/investigate")
 async def investigate(request: InvestigationRequest) -> dict:
     try:
@@ -226,7 +266,11 @@ async def scan_live(request: LiveScanRequest) -> dict:
         graph = store()
         imported = [graph.ingest(snapshot) for snapshot in snapshots]
         graph.prune_missing_projects(snapshots[0].repo.split("::")[0], {snapshot.repo for snapshot in snapshots})
-        results = [investigate_one(graph, snapshot.repo, advisory) for snapshot in snapshots]
+        results = []
+        for snapshot in snapshots:
+            result = investigate_one(graph, snapshot.repo, advisory)
+            await enrich_live_result(graph, snapshot, advisory, result)
+            results.append(result)
         order = {"affected_exposed": 0, "affected_exposure_unknown": 1, "affected_internal_declared": 2, "insufficient_evidence": 3, "not_affected_version": 4, "not_present": 5}
         results.sort(key=lambda row: (order[row["verdict"]], row["repo"]))
         return {
@@ -274,17 +318,17 @@ async def preview_fix(request: PreviewRequest) -> dict:
         paths = graph.paths_to(request.repo, request.package)
         affected = [
             path for path in paths
-            if len(path["nodes"]) == 2 and any(
+            if any(
                 p.name == request.package and is_affected(path["version"], p.vulnerable_range) is True
                 for p in advisory.packages
             )
         ]
         if not affected:
-            raise ValueError("No affected direct dependency path supports an automated fix")
+            raise ValueError("No affected dependency path supports an automated fix")
         snapshot = await fetch_public_repo(request.repo)
         if snapshot.sha != repo_record["sha"]:
             raise ValueError("Repository changed since ingestion; import it again before proposing a fix")
-        _, preview = build_preview(snapshot, advisory, request.package, [node.get("name") or node.get("id") for node in affected[0]["nodes"]])
+        _, preview = await build_preview(snapshot, advisory, request.package, [node.get("name") or node.get("id") for node in affected[0]["nodes"]])
         return preview
     except HTTPException:
         raise

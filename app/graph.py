@@ -12,6 +12,7 @@ from .lockfile import edges_from_lockfile, parse_lockfile
 from .pnpm_lock import parse_pnpm_project
 from .yarn_lock import parse_yarn_project
 from .sources import Snapshot
+from .module_trace import ModuleTrace
 
 
 class GraphStore:
@@ -106,6 +107,79 @@ class GraphStore:
             {"nodes": [node.properties for node in row[0].nodes()], "version": row[1], "dependency_id": row[2]}
             for row in rows
         ]
+
+    def save_module_trace(self, repo: str, trace: ModuleTrace) -> None:
+        """Keep the inspected file/import edges beside the dependency path."""
+        parent_id = f"{repo}:{trace.parent_path}"
+        target_id = f"{repo}:{trace.target_path}"
+        analysis_id = f"{parent_id}:analysis:{trace.target_path}"
+        self.graph.query(
+            "MATCH (parent:Dependency {id:$parent}), (target:Dependency {id:$target}) "
+            "MERGE (a:ModuleAnalysis {id:$id}) SET a.repo_id=$repo, a.status=$status, "
+            "a.source_url=$url, a.main_file=$main, a.evidence_file=$evidence_file, "
+            "a.evidence_line=$evidence_line "
+            "MERGE (parent)-[:HAS_MODULE_ANALYSIS]->(a) MERGE (a)-[:ANALYZES]->(target)",
+            {"parent": parent_id, "target": target_id, "id": analysis_id, "repo": repo,
+             "status": trace.status, "url": trace.source_url, "main": trace.main,
+             "evidence_file": trace.evidence_file or "", "evidence_line": trace.evidence_line or 0},
+        )
+        rows = [{"id": f"{parent_id}:module:{file}", "repo": repo, "file": file} for file in trace.files]
+        self.graph.query(
+            "UNWIND $rows AS row MERGE (m:ModuleFile {id:row.id}) SET m.repo_id=row.repo, m.file=row.file",
+            {"rows": rows},
+        )
+        self.graph.query(
+            "MATCH (a:ModuleAnalysis {id:$id}), (m:ModuleFile {id:$module}) MERGE (a)-[:MAIN_ENTRY]->(m)",
+            {"id": analysis_id, "module": f"{parent_id}:module:{trace.main}"},
+        )
+        if trace.bins:
+            self.graph.query(
+                "MATCH (a:ModuleAnalysis {id:$id}) UNWIND $ids AS module_id "
+                "MATCH (m:ModuleFile {id:module_id}) MERGE (a)-[:CLI_ENTRY]->(m)",
+                {"id": analysis_id, "ids": [f"{parent_id}:module:{file}" for file in trace.bins]},
+            )
+        if trace.file_edges:
+            self.graph.query(
+                "UNWIND $rows AS row MATCH (src:ModuleFile {id:row.src}), (dst:ModuleFile {id:row.dst}) "
+                "MERGE (src)-[edge:IMPORTS_MODULE]->(dst) SET edge.line=row.line",
+                {"rows": [{"src": f"{parent_id}:module:{src}", "dst": f"{parent_id}:module:{dst}", "line": line}
+                          for src, dst, line in trace.file_edges]},
+            )
+        if trace.package_edges:
+            self.graph.query(
+                "MATCH (target:Dependency {id:$target}) UNWIND $rows AS row "
+                "MATCH (src:ModuleFile {id:row.src}) MERGE (src)-[edge:IMPORTS_PACKAGE]->(target) SET edge.line=row.line",
+                {"target": target_id, "rows": [{"src": f"{parent_id}:module:{file}", "line": line}
+                                                for file, line in trace.package_edges]},
+            )
+
+    def module_evidence(self, repo: str, parent_path: str, target_path: str) -> dict[str, Any] | None:
+        analysis_id = f"{repo}:{parent_path}:analysis:{target_path}"
+        rows = self.graph.ro_query(
+            "MATCH (p:Dependency)-[:HAS_MODULE_ANALYSIS]->(a:ModuleAnalysis {id:$id}) "
+            "RETURN a.source_url, a.main_file, p.name, p.version LIMIT 1",
+            {"id": analysis_id}, timeout=3000,
+        ).result_set
+        if not rows:
+            return None
+        url, main, parent_name, parent_version = rows[0]
+        # The verdict is read from actual import paths in FalkorDB, not from the
+        # cached status string computed while parsing the archive.
+        def path_from(entry: str) -> list:
+            return self.graph.ro_query(
+                f"MATCH (a:ModuleAnalysis {{id:$id}})-[:{entry}]->(start:ModuleFile), "
+                "(a)-[:ANALYZES]->(target:Dependency) "
+                "MATCH p=(start)-[:IMPORTS_MODULE*0..16]->(last:ModuleFile)-[imp:IMPORTS_PACKAGE]->(target) "
+                "RETURN last.file, imp.line ORDER BY length(p) LIMIT 1",
+                {"id": analysis_id}, timeout=3000,
+            ).result_set
+        runtime_path = path_from("MAIN_ENTRY")
+        cli_path = path_from("CLI_ENTRY") if not runtime_path else []
+        status = "runtime_static_path" if runtime_path else "cli_only_static_path" if cli_path else "no_static_path"
+        file, line = (runtime_path or cli_path or [[None, None]])[0]
+        return {"status": status, "parent": parent_name, "parent_version": parent_version,
+                "main": main, "file": file or None, "line": line or None, "source_url": url,
+                "scope": "Static imports within the immediate parent package; dynamic loads and CLI execution are not ruled out."}
 
     def context(self, repo: str, advisory_id: str) -> dict[str, Any]:
         repo_rows = self.graph.ro_query(

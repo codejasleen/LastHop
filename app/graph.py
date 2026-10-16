@@ -13,6 +13,7 @@ from .pnpm_lock import parse_pnpm_project
 from .yarn_lock import parse_yarn_project
 from .sources import Snapshot
 from .module_trace import ModuleTrace
+from .pip_requirements import parse_requirements
 
 
 class GraphStore:
@@ -32,9 +33,10 @@ class GraphStore:
         self.graph.query("MATCH (n {repo_id:$repo}) WHERE NOT n:Decision DETACH DELETE n", {"repo": repo})
         self.graph.query(
             "MERGE (r:Repo {id:$repo}) SET r.repo_id=$repo, r.sha=$sha, r.source=$source, "
-            "r.manager=$manager, r.project_path=$project_path, r.ingested_at=$now, r.complete=true",
+            "r.manager=$manager, r.project_path=$project_path, r.ingested_at=$now, r.complete=$complete",
             {"repo": repo, "sha": snapshot.sha, "source": snapshot.source, "manager": snapshot.manager,
-             "project_path": snapshot.project_path, "now": datetime.now(timezone.utc).isoformat()},
+             "project_path": snapshot.project_path, "complete": snapshot.manager != "pip",
+             "now": datetime.now(timezone.utc).isoformat()},
         )
         self.graph.query(
             "MATCH (r:Repo {id:$repo}), (d:Decision {repo_id:$repo}) MERGE (r)-[:HAS_DECISION]->(d)",
@@ -49,6 +51,20 @@ class GraphStore:
                 "UNWIND $rows AS row MERGE (d:Dependency {id:row.id}) "
                 "SET d.repo_id=row.repo, d.path=row.path, d.name=row.name, d.version=row.version",
                 {"rows": rows},
+            )
+            # Instances remain repo-specific; PackageVersion is shared across repos.
+            self.graph.query(
+                "UNWIND $rows AS row MATCH (d:Dependency {id:row.id}) "
+                "MERGE (p:PackageVersion {id:$ecosystem + ':' + row.name + '@' + row.version}) "
+                "SET p.ecosystem=$ecosystem, p.name=row.name, p.version=row.version "
+                "MERGE (d)-[:INSTANCE_OF]->(p)",
+                {"rows": rows, "ecosystem": "PyPI" if snapshot.manager == "pip" else "npm"},
+            )
+            self.graph.query(
+                "MATCH (d:Dependency {repo_id:$repo}), (c:Commit) "
+                "WHERE c.dependency_id=d.id AND c.introduced_version=d.version AND c.snapshot_sha=$sha "
+                "MERGE (c)-[:INTRODUCED_PIN]->(d)",
+                {"repo": repo, "sha": snapshot.sha},
             )
         direct = [{"child": f"{repo}:{child}"} for parent, child in edges if not parent]
         nested = [{"parent": f"{repo}:{parent}", "child": f"{repo}:{child}"} for parent, child in edges if parent]
@@ -87,6 +103,56 @@ class GraphStore:
         rows = self.graph.ro_query("MATCH (r:Repo) RETURN r.id, r.sha, r.source, r.manager ORDER BY r.id LIMIT 100", timeout=3000).result_set
         return [{"repo": r[0], "sha": r[1], "source": r[2], "manager": r[3]} for r in rows]
 
+    def ingest_deployments(self, github_repo: str, snapshots: list[Snapshot]) -> dict[str, int]:
+        """Store real manifest routes and workload calls beside package projects."""
+        workloads = snapshots[0].deployments if snapshots else ()
+        self.graph.query("MATCH (n {deployment_repo:$repo}) WHERE n:Service OR n:Exposure DETACH DELETE n", {"repo": github_repo})
+        if not workloads:
+            return {"workloads": 0, "calls": 0, "public_routes": 0}
+        project_by_workload = {}
+        for snapshot in snapshots:
+            leaf = snapshot.project_path.rsplit("/", 1)[-1].lower()
+            if leaf:
+                project_by_workload[leaf] = snapshot.repo
+        for workload in workloads:
+            name = workload["name"]
+            identifier = f"{github_repo}:workload:{name}"
+            project = project_by_workload.get(name.lower())
+            self.graph.query(
+                "MERGE (s:Service {id:$id}) SET s.name=$name, s.deployment_repo=$root, "
+                "s.exposure=$exposure, s.evidence=$source",
+                {"id": identifier, "name": name, "root": github_repo, "source": workload["source"],
+                 "exposure": "public" if workload["public_routes"] else "internal"},
+            )
+            if project:
+                self.graph.query("MATCH (r:Repo {id:$repo}), (s:Service {id:$id}) MERGE (r)-[:RUNS]->(s)",
+                                 {"repo": project, "id": identifier})
+            for route in workload["public_routes"]:
+                route_id = f"{identifier}:route:{route['service']}"
+                self.graph.query(
+                    "MERGE (i:Internet {id:'internet'}) MERGE (e:Exposure {id:$route}) "
+                    "SET e.deployment_repo=$repo, e.kind=$kind, e.evidence=$evidence, e.url=$url "
+                    "WITH i,e MATCH (s:Service {id:$service}) "
+                    "MERGE (i)-[:REACHES]->(e) MERGE (e)-[:ROUTES_TO]->(s)",
+                    {"route": route_id, "repo": github_repo, "kind": route["kind"], "evidence": route["source"],
+                     "url": route.get("host") or route["service"], "service": identifier},
+                )
+        count = 0
+        for workload in workloads:
+            for call in workload["calls"]:
+                if not call.get("workload"):
+                    continue
+                self.graph.query(
+                    "MATCH (a:Service {id:$source}), (b:Service {id:$target}) "
+                    "MERGE (a)-[c:CALLS]->(b) SET c.evidence=$evidence, c.variable=$variable",
+                    {"source": f"{github_repo}:workload:{workload['name']}",
+                     "target": f"{github_repo}:workload:{call['workload']}",
+                     "evidence": call["source"], "variable": call["variable"]},
+                )
+                count += 1
+        return {"workloads": len(workloads), "calls": count,
+                "public_routes": sum(len(row["public_routes"]) for row in workloads)}
+
     def prune_missing_projects(self, github_repo: str, current: set[str]) -> None:
         """Retire lockfile projects removed from a GitHub repo's latest snapshot."""
         for row in self.repositories():
@@ -96,6 +162,7 @@ class GraphStore:
                     "MATCH (n {repo_id:$repo}) WHERE NOT n:Decision DETACH DELETE n",
                     {"repo": project},
                 )
+        self.graph.query("MATCH (p:PackageVersion) WHERE NOT (p)<-[:INSTANCE_OF]-(:Dependency) DELETE p")
 
     def paths_to(self, repo: str, package_name: str) -> list[dict[str, Any]]:
         rows = self.graph.ro_query(
@@ -183,7 +250,7 @@ class GraphStore:
 
     def context(self, repo: str, advisory_id: str) -> dict[str, Any]:
         repo_rows = self.graph.ro_query(
-            "MATCH (r:Repo {id:$repo}) RETURN r.manager, r.project_path LIMIT 1", {"repo": repo}, timeout=3000
+            "MATCH (r:Repo {id:$repo}) RETURN r.manager, r.project_path, r.sha, r.complete LIMIT 1", {"repo": repo}, timeout=3000
         ).result_set
         owner_rows = self.graph.ro_query(
             "MATCH (:Repo {id:$repo})-[:OWNED_BY]->(o:Owner) RETURN o.name LIMIT 1", {"repo": repo}, timeout=3000
@@ -193,17 +260,31 @@ class GraphStore:
             "OPTIONAL MATCH (s)-[:EXPOSES]->(e:Exposure) RETURN s.name, s.exposure, e.url LIMIT 20",
             {"repo": repo}, timeout=3000,
         ).result_set
+        exposure_rows = self.graph.ro_query(
+            "MATCH (r:Repo {id:$repo})-[:RUNS]->(s:Service), (i:Internet {id:'internet'}) "
+            "WITH s, shortestPath((i)-[:REACHES|ROUTES_TO|CALLS*1..12]->(s)) AS p "
+            "RETURN s.id, p LIMIT 20",
+            {"repo": repo}, timeout=3000,
+        ).result_set
+        exposure_paths = {row[0]: [node.properties for node in row[1].nodes()] for row in exposure_rows if row[1]}
         decision_rows = self.graph.ro_query(
             "MATCH (:Repo {id:$repo})-[:HAS_DECISION]->(d:Decision {advisory_id:$advisory}) "
-            "RETURN d.verdict, d.reason, d.created_at ORDER BY d.created_at DESC LIMIT 5",
+            "RETURN d.verdict, d.reason, d.created_at, d.snapshot_sha ORDER BY d.created_at DESC LIMIT 5",
             {"repo": repo, "advisory": advisory_id}, timeout=3000,
         ).result_set
         return {
             "manager": repo_rows[0][0] if repo_rows and repo_rows[0][0] else "npm",
             "project_path": repo_rows[0][1] if repo_rows and repo_rows[0][1] else "",
+            "sha": repo_rows[0][2] if repo_rows else None,
+            "complete": repo_rows[0][3] if repo_rows else False,
             "owner": owner_rows[0][0] if owner_rows else None,
-            "services": [{"name": row[0], "exposure": row[1], "public_route": row[2]} for row in service_rows],
-            "decisions": [{"verdict": row[0], "reason": row[1], "created_at": row[2]} for row in decision_rows],
+            "services": [{"name": row[0], "exposure": "public" if any(path[-1].get("name") == row[0] for path in exposure_paths.values()) else row[1],
+                          "public_route": row[2] or next((path[1].get("url") for path in exposure_paths.values() if path[-1].get("name") == row[0]), None),
+                          "exposure_path": next((path for path in exposure_paths.values() if path[-1].get("name") == row[0]), [])}
+                         for row in service_rows],
+            "decisions": [{"verdict": row[0], "reason": row[1], "created_at": row[2],
+                           "snapshot_sha": row[3], "stale": not row[3] or row[3] != repo_rows[0][2]}
+                          for row in decision_rows],
         }
 
 
@@ -215,15 +296,98 @@ class GraphStore:
                 "MERGE (a)-[:AFFECTS]->(d)",
                 {"id": advisory_id, "ids": dependency_ids},
             )
+            self.graph.query(
+                "MATCH (a:Advisory {id:$id}) UNWIND $ids AS dep_id "
+                "MATCH (d:Dependency {id:dep_id})-[:INSTANCE_OF]->(p:PackageVersion) "
+                "MERGE (a)-[:AFFECTS_VERSION]->(p)",
+                {"id": advisory_id, "ids": dependency_ids},
+            )
+
+    def advisory_fanout(self, advisory_id: str) -> list[dict[str, Any]]:
+        """A single graph read joins one advisory to all installed project instances."""
+        rows = self.graph.ro_query(
+            "MATCH (a:Advisory {id:$id})-[:AFFECTS_VERSION]->(p:PackageVersion)"
+            "<-[:INSTANCE_OF]-(d:Dependency) "
+            "MATCH path=(r:Repo)-[:DEPENDS_ON*1..12]->(d) "
+            "RETURN r.id, p.name, p.version, length(path), r.sha "
+            "ORDER BY r.id, length(path) LIMIT 100",
+            {"id": advisory_id}, timeout=3000,
+        ).result_set
+        return [{"repo": row[0], "package": row[1], "version": row[2],
+                 "dependency_hops": row[3], "sha": row[4]} for row in rows]
+
+    def service_betweenness(self, github_repo: str) -> list[dict[str, Any]]:
+        """Rank declared service-call bridges using FalkorDB's algorithm procedure."""
+        rows = self.graph.ro_query(
+            "CALL algo.betweenness({nodeLabels:['Service'], relationshipTypes:['CALLS']}) "
+            "YIELD node, score WITH node, score WHERE node.deployment_repo=$repo "
+            "RETURN node.name, score ORDER BY score DESC LIMIT 20",
+            {"repo": github_repo}, timeout=3000,
+        ).result_set
+        return [{"service": name, "betweenness": score} for name, score in rows]
 
     def save_decision(self, repo: str, advisory_id: str, verdict: str, reason: str) -> None:
-        if not self.graph.ro_query("MATCH (r:Repo {id:$repo}) RETURN r.id LIMIT 1", {"repo": repo}, timeout=3000).result_set:
+        repo_rows = self.graph.ro_query("MATCH (r:Repo {id:$repo}) RETURN r.sha LIMIT 1", {"repo": repo}, timeout=3000).result_set
+        if not repo_rows:
             raise LookupError("Repository is not in the graph")
         self.graph.query(
             "MATCH (r:Repo {id:$repo}) CREATE (d:Decision {repo_id:$repo, advisory_id:$advisory, "
-            "verdict:$verdict, reason:$reason, created_at:$now}) CREATE (r)-[:HAS_DECISION]->(d)",
-            {"repo": repo, "advisory": advisory_id, "verdict": verdict, "reason": reason, "now": datetime.now(timezone.utc).isoformat()},
+            "verdict:$verdict, reason:$reason, created_at:$now, snapshot_sha:$sha}) CREATE (r)-[:HAS_DECISION]->(d)",
+            {"repo": repo, "advisory": advisory_id, "verdict": verdict, "reason": reason,
+             "sha": repo_rows[0][0], "now": datetime.now(timezone.utc).isoformat()},
         )
+
+    def save_provenance(self, repo: str, dependency_id: str, evidence: dict[str, Any]) -> None:
+        if evidence.get("status") != "verified":
+            return
+        snapshot_rows = self.graph.ro_query("MATCH (r:Repo {id:$repo}) RETURN r.sha LIMIT 1",
+                                            {"repo": repo}, timeout=3000).result_set
+        if not snapshot_rows:
+            return
+        self.graph.query(
+            "MATCH (d:Dependency {id:$dependency}) "
+            "MERGE (c:Commit {id:$commit}) SET c.url=$url, c.deployment_repo=$repo, "
+            "c.dependency_id=$dependency, c.introduced_version=$version, c.snapshot_sha=$sha "
+            "MERGE (c)-[:INTRODUCED_PIN]->(d) "
+            "MERGE (author:Person {id:$author_id}) SET author.role='author' "
+            "MERGE (author)-[:AUTHORED]->(c)",
+            {"dependency": dependency_id, "commit": evidence["commit"], "url": evidence["commit_url"],
+             "repo": repo.split("::")[0], "version": evidence.get("version"),
+             "sha": snapshot_rows[0][0],
+             "author_id": f"{evidence['commit']}:author"},
+        )
+        pr = evidence.get("pull_request")
+        if pr:
+            pr_id = f"{repo.split('::')[0]}#{pr['number']}"
+            self.graph.query(
+                "MATCH (c:Commit {id:$commit}) MERGE (pr:PullRequest {id:$pr}) "
+                "SET pr.url=$url, pr.deployment_repo=$repo, pr.verification=$verification "
+                "MERGE (pr)-[:CONTAINS]->(c)",
+                {"commit": evidence["commit"], "pr": pr_id, "url": pr["url"], "repo": repo.split("::")[0],
+                 "verification": pr.get("verification", "github_api")},
+            )
+            for index, _reviewer in enumerate(evidence.get("reviewers", [])):
+                self.graph.query(
+                    "MATCH (pr:PullRequest {id:$pr}) MERGE (p:Person {id:$reviewer}) "
+                    "SET p.role='reviewer' MERGE (p)-[:APPROVED]->(pr)",
+                    {"pr": pr_id, "reviewer": f"{pr_id}:reviewer:{index}"},
+                )
+
+    def saved_provenance(self, dependency_id: str) -> dict[str, Any] | None:
+        rows = self.graph.ro_query(
+            "MATCH (c:Commit)-[:INTRODUCED_PIN]->(d:Dependency {id:$dependency}) "
+            "OPTIONAL MATCH (pr:PullRequest)-[:CONTAINS]->(c) "
+            "RETURN c.id, c.url, d.version, pr.id, pr.url, pr.verification LIMIT 1",
+            {"dependency": dependency_id}, timeout=3000,
+        ).result_set
+        if not rows:
+            return None
+        commit, url, version, pr_id, pr_url, verification = rows[0]
+        return {"status": "verified", "source": "stored_graph", "commit": commit, "commit_url": url,
+                "version": version, "author": None, "reviewers": [],
+                "pull_request": {"number": int(pr_id.rsplit("#", 1)[-1]), "url": pr_url,
+                                 "verification": verification} if pr_id else None,
+                "note": "Public author/reviewer names are not retained in FalkorDB."}
 
 
 def dependency_graph(snapshot: Snapshot) -> tuple[list, list[tuple[str, str]]]:
@@ -234,4 +398,6 @@ def dependency_graph(snapshot: Snapshot) -> tuple[list, list[tuple[str, str]]]:
         return parse_pnpm_project(snapshot.lockfile, snapshot.importer)
     if snapshot.manager == "yarn":
         return parse_yarn_project(snapshot.lockfile_text or "", snapshot.package_json)
+    if snapshot.manager == "pip":
+        return parse_requirements(snapshot.lockfile_text or "")
     raise ValueError(f"Unsupported package manager: {snapshot.manager}")

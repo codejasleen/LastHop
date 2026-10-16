@@ -1,5 +1,8 @@
-from app.advisories import DEMO_ADVISORY, is_affected
+from app.advisories import Advisory, AffectedPackage, is_affected
 from app.main import investigate_one
+
+
+TEST_ADVISORY = Advisory("CVE-2026-12143", "Test advisory", "high", "", [AffectedPackage("form-data", "<2.5.6", "2.5.6")])
 
 
 class FakeGraph:
@@ -20,18 +23,18 @@ class FakeGraph:
 
 def test_affected_public_result_carries_graph_path():
     graph = FakeGraph(
-        [{"nodes": [{"id": "demo/storefront"}, {"name": "web-framework"}, {"name": "render-kit"}], "version": "1.2.0", "dependency_id": "demo/storefront:render-kit"}],
+        [{"nodes": [{"id": "example/service"}, {"name": "retry-request"}, {"name": "form-data"}], "version": "2.5.5", "dependency_id": "example/service:form-data"}],
         [{"name": "storefront", "exposure": "public", "public_route": "https://example.test"}],
     )
-    result = investigate_one(graph, "demo/storefront", DEMO_ADVISORY)
+    result = investigate_one(graph, "example/service", TEST_ADVISORY)
     assert result["verdict"] == "affected_exposed"
-    assert result["vulnerable_paths"][0]["path"] == ["demo/storefront", "web-framework", "render-kit"]
-    assert graph.linked == ["demo/storefront:render-kit"]
+    assert result["vulnerable_paths"][0]["path"] == ["example/service", "retry-request", "form-data"]
+    assert graph.linked == ["example/service:form-data"]
 
 
 def test_unknown_exposure_stays_unknown():
-    graph = FakeGraph([{"nodes": [{"id": "repo"}, {"name": "render-kit"}], "version": "1.2.0", "dependency_id": "repo:render-kit"}], [])
-    assert investigate_one(graph, "repo", DEMO_ADVISORY)["verdict"] == "affected_exposure_unknown"
+    graph = FakeGraph([{"nodes": [{"id": "repo"}, {"name": "form-data"}], "version": "2.5.5", "dependency_id": "repo:form-data"}], [])
+    assert investigate_one(graph, "repo", TEST_ADVISORY)["verdict"] == "affected_exposure_unknown"
 
 
 def test_npm_semver_not_lexicographic():

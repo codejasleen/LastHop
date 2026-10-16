@@ -3,10 +3,13 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({'&
 const labels = {
   affected_exposed: 'Affected · public',
   affected_exposure_unknown: 'Affected · exposure unknown',
+  declared_exposed: 'Python pin · public path',
+  declared_exposure_unknown: 'Python pin · exposure unknown',
   affected_internal_declared: 'Affected · internal declared',
   insufficient_evidence: 'Insufficient evidence',
   not_affected_version: 'Version unaffected',
-  not_present: 'Package not present'
+  not_present: 'Package not present',
+  not_applicable: 'Different ecosystem'
 };
 let noticeTimer;
 let currentAdvisory = null;
@@ -37,9 +40,7 @@ async function refresh() {
     $('connection-label').textContent = ok ? 'FalkorDB connected' : 'FalkorDB unavailable';
     $('repo-count').textContent = `${repos.length} ${repos.length === 1 ? 'repo' : 'repos'}`;
     $('repo-list').innerHTML = repos.length
-      ? repos.map(r => r.repo.startsWith('demo/')
-        ? `<div class="repo-pill demo" title="Synthetic fixture">${escapeHtml(r.repo)}</div>`
-        : `<button class="repo-pill" type="button" data-repo="${escapeHtml(r.repo.split('::')[0])}" title="Scan latest commit of ${escapeHtml(r.repo)}">${escapeHtml(r.repo)}${r.manager ? ` · ${escapeHtml(r.manager)}` : ''}</button>`).join('')
+      ? repos.map(r => `<button class="repo-pill" type="button" data-repo="${escapeHtml(r.repo.split('::')[0])}" title="Scan latest commit of ${escapeHtml(r.repo)}">${escapeHtml(r.repo)}${r.manager ? ` · ${escapeHtml(r.manager)}` : ''}</button>`).join('')
       : '<div class="empty-small">No repositories imported yet.</div>';
   } catch (error) {
     $('connection-dot').className = 'dot bad';
@@ -54,10 +55,10 @@ function pathHtml(parts) {
 
 function resultHtml(result) {
   const paths = result.vulnerable_paths.length
-    ? result.vulnerable_paths.map(p => `<div class="detail">${pathHtml(p.path)}<div style="margin-top:8px">Installed <strong>${escapeHtml(p.package)}@${escapeHtml(p.version)}</strong> · affected range ${escapeHtml(p.range)}</div></div>`).join('')
+    ? result.vulnerable_paths.map(p => `<div class="detail">${pathHtml(p.path)}<div style="margin-top:8px">${p.evidence_kind === 'declared_pin' ? 'Declared pin' : 'Installed'} <strong>${escapeHtml(p.package)}@${escapeHtml(p.version)}</strong> · affected range ${escapeHtml(p.range)}</div></div>`).join('')
     : '<div class="detail">No vulnerable dependency path found in this snapshot.</div>';
   const services = result.services.length
-    ? result.services.map(s => `<div class="detail"><strong>${escapeHtml(s.name)}</strong> · ${escapeHtml(s.exposure)}${s.public_route ? `<br>${escapeHtml(s.public_route)}` : ''}</div>`).join('')
+    ? result.services.map(s => `<div class="detail"><strong>${escapeHtml(s.name)}</strong> · ${escapeHtml(s.exposure)}${s.public_route ? `<br>Public entry: ${escapeHtml(s.public_route)}` : ''}${s.exposure_path?.length ? `<br>${pathHtml(s.exposure_path.map(n => n.name || n.kind || (n.id === 'internet' ? 'Internet' : n.url || n.id)))}<span class="evidence-caveat">${escapeHtml(s.exposure_path.map(n => n.evidence).filter(Boolean).join(' → '))}</span>` : ''}</div>`).join('')
     : '<div class="detail">No deployment evidence supplied. Exposure is unknown.</div>';
   const fix = result.fix_candidates.length
     ? result.fix_candidates.map(f => f.strategy === 'lockfile_refresh'
@@ -65,7 +66,7 @@ function resultHtml(result) {
       : `${escapeHtml(f.package)} → ${escapeHtml(f.first_patched)} (review parent range)`).join(', ')
     : 'No verified patch candidate in advisory';
   const fixable = result.fix_candidates.find(f => f.strategy === 'lockfile_refresh');
-  const action = fixable && result.fix_supported && !result.repo.startsWith('demo/')
+  const action = fixable && result.fix_supported
     ? `<button class="secondary fix-action" data-fix-repo="${escapeHtml(result.repo)}" data-fix-package="${escapeHtml(fixable.package)}">Review lockfile fix →</button>`
     : '';
   const moduleEvidence = (result.module_evidence || []).map(e => {
@@ -84,31 +85,39 @@ function resultHtml(result) {
     ? `<button class="ghost decision-action" data-decision-repo="${escapeHtml(result.repo)}">Record decision</button>`
     : '';
   const priorDecision = result.prior_decisions.length
-    ? `<div class="decision-memory"><div class="evidence-label">Last recorded decision</div><strong>${escapeHtml(result.prior_decisions[0].verdict)}</strong> · ${escapeHtml(result.prior_decisions[0].reason)}</div>`
+    ? `<div class="decision-memory"><div class="evidence-label">Last recorded decision ${result.prior_decisions[0].stale ? '· review again: repository changed' : '· current commit'}</div><strong>${escapeHtml(result.prior_decisions[0].verdict)}</strong> · ${escapeHtml(result.prior_decisions[0].reason)}</div>`
     : '';
+  const provenance = result.vulnerable_paths.length && result.provenance_supported
+    ? `<button class="ghost provenance-action" data-provenance-repo="${escapeHtml(result.repo)}" data-dependency-id="${escapeHtml(result.vulnerable_paths[0].dependency_id)}">Trace introducing commit →</button><div class="provenance-result"></div>` : '';
   return `<article class="result-card ${escapeHtml(result.verdict)}">
     <div class="result-head"><h3>${escapeHtml(result.repo)}</h3><span class="badge">${escapeHtml(result.priority || 'Review')}${result.priority?.startsWith('P') ? ' provisional' : ''} · ${escapeHtml(labels[result.verdict] || result.verdict)}</span></div>
     <p class="result-explanation">${escapeHtml(result.explanation)}</p>
     <div class="evidence"><div class="evidence-box"><div class="evidence-label">Dependency path · FalkorDB</div>${paths}</div><div class="evidence-box"><div class="evidence-label">Module entry evidence · FalkorDB</div>${moduleEvidence}</div><div class="evidence-box"><div class="evidence-label">Deployment evidence</div>${services}</div></div>
-    <div class="result-foot"><span>Owner <strong>${escapeHtml(result.owner || 'unknown')}</strong></span><span>Fix <strong>${fix}</strong></span><span>Prior decisions <strong>${result.prior_decisions.length}</strong></span></div>${priorDecision}${action}${decisionAction}
+    <div class="result-foot"><span>Owner <strong>${escapeHtml(result.owner || 'unknown')}</strong></span><span>Fix <strong>${fix}</strong></span><span>Prior decisions <strong>${result.prior_decisions.length}</strong></span></div>${priorDecision}<div class="detail">${escapeHtml((result.priority_reasons || []).join(' · '))}</div>${action}${decisionAction}${provenance}
   </article>`;
 }
 
-function renderResults(data) {
+function renderResults(data, agent = null) {
   currentAdvisory = data.advisory.id;
   $('results-section').classList.remove('hidden');
   $('results-title').textContent = data.advisory.id;
   $('results-summary').textContent = data.advisory.summary;
   $('results-severity').textContent = `Advisory severity: ${data.advisory.severity}`;
+  const risk = data.risk_signals;
+  $('agent-summary').textContent = agent?.summary || '';
+  $('agent-trace').textContent = agent ? `MCP tools: ${agent.tool_trace.map(step => step.tool).join(' → ')}` : '';
+  $('graph-summary').textContent = agent ? `Graph fan-out: ${agent.evidence.advisory_fanout?.count ?? 0} affected projects · service bridge ranking: ${(agent.evidence.service_bridges?.services || []).slice(0, 3).map(s => `${s.service} ${s.betweenness}`).join(', ') || 'unavailable'}${risk ? ` · KEV: ${risk.kev === null ? 'unknown' : risk.kev ? 'listed' : 'not listed'} · EPSS: ${risk.epss === null ? 'unknown' : (risk.epss * 100).toFixed(2) + '%'}` : ''}` : '';
   $('results-source').textContent = data.source
     ? `${data.source.repo} · latest commit ${data.source.sha.slice(0, 10)} · ${data.source.projects} ${data.source.projects === 1 ? 'project' : 'projects'} · ${data.source.dependencies} dependencies · ${new Date(data.source.scanned_at).toLocaleString()}`
-    : 'Synthetic incident · stored graph snapshot';
+    : 'Stored graph snapshot';
   const scope = [];
-  if (data.source && !data.source.project_paths.includes('.')) scope.push('Only the listed subprojects have supported lockfiles; the repository root was not analyzed.');
+  if (data.source && !data.source.project_paths.includes('.')) scope.push('Only the listed subprojects have supported dependency manifests; the repository root was not analyzed.');
   if (data.source?.other_manifests?.length) scope.push(`Other root manifests not analyzed: ${data.source.other_manifests.join(', ')}.`);
+  const unrelated = data.results.filter(result => result.verdict === 'not_applicable').length;
+  if (unrelated) scope.push(`${unrelated} project(s) use a different package ecosystem and are omitted below.`);
   $('results-scope').textContent = scope.join(' ');
   $('results-scope').classList.toggle('hidden', !scope.length);
-  $('results').innerHTML = data.results.map(resultHtml).join('');
+  $('results').innerHTML = data.results.filter(result => result.verdict !== 'not_applicable').map(resultHtml).join('');
   $('results-section').scrollIntoView({behavior:'smooth', block:'start'});
 }
 
@@ -118,25 +127,19 @@ $('investigation-form').addEventListener('submit', async event => {
   button.disabled = true;
   button.textContent = 'Scanning…';
   try {
-    const data = await api('/api/scan/live', {method:'POST', body:JSON.stringify({repo:$('live-repo').value, advisory:$('advisory').value})});
-    renderResults(data);
+    const question = $('agent-question').value.trim() || `Investigate ${$('advisory').value} in ${$('live-repo').value} and show graph impact`;
+    const agent = await api('/api/agent', {method:'POST', body:JSON.stringify({repo:$('live-repo').value, advisory:$('advisory').value, question})});
+    renderResults(agent.evidence.scan_public_repo, agent);
     await refresh();
   } catch (error) { notice(error.message, true); }
   finally { button.disabled = false; button.innerHTML = 'Scan latest <span aria-hidden="true">→</span>'; }
 });
 
-$('seed-demo').addEventListener('click', async event => {
-  const button = event.currentTarget;
-  button.disabled = true;
-  button.textContent = 'Loading…';
-  try {
-    const data = await api('/api/demo/seed', {method:'POST'});
-    const investigation = await api('/api/investigate', {method:'POST', body:JSON.stringify({advisory:'DEMO-2026-001', demo_only:true})});
-    renderResults(investigation);
-    notice(`Loaded ${data.ingested.length} synthetic repositories into FalkorDB`);
-    await refresh();
-  } catch (error) { notice(error.message, true); }
-  finally { button.disabled = false; button.textContent = 'Run sample investigation'; }
+$('real-example').addEventListener('click', () => {
+  $('live-repo').value = 'GoogleCloudPlatform/microservices-demo';
+  $('advisory').value = 'CVE-2026-12143';
+  $('agent-question').value = 'What is the blast radius and public path?';
+  $('investigation-form').requestSubmit();
 });
 
 $('repo-list').addEventListener('click', event => {
@@ -148,6 +151,19 @@ $('repo-list').addEventListener('click', event => {
 });
 
 $('results').addEventListener('click', async event => {
+  const provenanceButton = event.target.closest('[data-provenance-repo]');
+  if (provenanceButton) {
+    provenanceButton.disabled = true;
+    provenanceButton.textContent = 'Tracing Git history…';
+    try {
+      const result = await api('/api/provenance', {method:'POST', body:JSON.stringify({repo:provenanceButton.dataset.provenanceRepo, dependency_id:provenanceButton.dataset.dependencyId})});
+      provenanceButton.nextElementSibling.innerHTML = result.status === 'verified'
+        ? `Introduced by <a href="${escapeHtml(result.commit_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(result.commit.slice(0, 10))}</a> · author ${escapeHtml(result.author || 'unknown')}${result.pull_request ? ` · <a href="${escapeHtml(result.pull_request.url)}" target="_blank" rel="noopener noreferrer">PR #${escapeHtml(result.pull_request.number)}</a>${result.pull_request.verification === 'commit_subject' ? ' (inferred from commit title)' : ''} · approving reviewer ${escapeHtml(result.reviewers.join(', ') || 'unknown')}` : ' · merged PR unknown'}`
+        : escapeHtml(result.reason || 'Git history could not verify the introducing commit.');
+    } catch (error) { notice(error.message, true); }
+    finally { provenanceButton.disabled = false; provenanceButton.textContent = 'Trace introducing commit →'; }
+    return;
+  }
   const decisionButton = event.target.closest('[data-decision-repo]');
   if (decisionButton) {
     decisionRepo = decisionButton.dataset.decisionRepo;

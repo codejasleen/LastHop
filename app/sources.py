@@ -8,6 +8,7 @@ import os
 import re
 import json
 import zipfile
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
@@ -17,6 +18,7 @@ import yaml
 
 
 REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_project_cache: dict[str, tuple[float, list[Snapshot]]] = {}
 
 
 def normalize_repo(repo: str) -> str:
@@ -49,6 +51,7 @@ class Snapshot:
     importer: str = "."
     lockfile_path: str = "package-lock.json"
     other_manifests: tuple[str, ...] = ()
+    deployments: tuple[dict[str, Any], ...] = ()
 
 
 def _headers() -> dict[str, str]:
@@ -140,10 +143,11 @@ async def _fetch_public_projects_api(repo: str) -> list[Snapshot]:
 async def _snapshots_from_files(
     repo: str, sha: str, paths: set[str], read_file: Callable[[str], Awaitable[bytes | None]]
 ) -> list[Snapshot]:
+    from .deployments import parse_kubernetes
     excluded = {"node_modules", "vendor", "testdata", "fixtures", "__fixtures__"}
     paths = {path for path in paths if not excluded.intersection(path.split("/"))}
     other_manifests = tuple(sorted(paths.intersection({
-        "go.mod", "Cargo.lock", "requirements.txt", "poetry.lock", "uv.lock", "Gemfile.lock", "pom.xml"
+        "go.mod", "Cargo.lock", "poetry.lock", "uv.lock", "Gemfile.lock", "pom.xml"
     })))
     locks: dict[str, tuple[str, str]] = {}
     ambiguous: set[str] = set()
@@ -158,11 +162,14 @@ async def _snapshots_from_files(
             locks[folder] = (filename, path)
     if ambiguous:
         raise ValueError(f"Multiple package-manager lockfiles in {', '.join(sorted(ambiguous))}; choose one lockfile before scanning")
-    if not locks:
+    requirements = sorted(path for path in paths if path.rsplit("/", 1)[-1] == "requirements.txt")
+    if not locks and not requirements:
         detail = f" Found {', '.join(other_manifests)} at the root." if other_manifests else ""
-        raise ValueError("No supported npm, pnpm, or Yarn lockfile was found; no CVE verdict was made." + detail)
+        raise ValueError("No supported npm, pnpm, Yarn lockfile or Python requirements.txt was found; no CVE verdict was made." + detail)
     if len(locks) > 20:
         raise ValueError("More than 20 lockfiles found; narrow project selection is not supported yet")
+    if len(locks) + len(requirements) > 30:
+        raise ValueError("More than 30 manifests found; narrow project selection is not supported yet")
     owners = None
     for owner_path in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
         if owner_path not in paths:
@@ -171,6 +178,16 @@ async def _snapshots_from_files(
         if owners:
             break
     owner = _owner_from_codeowners(owners.decode("utf-8") if owners else None)
+    kubernetes_paths = sorted(path for path in paths if path.endswith((".yaml", ".yml")) and
+                              any(part in ("kubernetes-manifests", "k8s", "kubernetes", "deploy") for part in path.split("/")))
+    if len(kubernetes_paths) > 60:
+        raise ValueError("More than 60 Kubernetes manifests found; deployment evidence is incomplete")
+    kubernetes_files = {}
+    for path in kubernetes_paths:
+        content = await read_file(path)
+        if content is not None:
+            kubernetes_files[path] = content.decode("utf-8", errors="replace")
+    deployments = tuple(parse_kubernetes(kubernetes_files))
     results: list[Snapshot] = []
     for folder, (filename, lock_path) in sorted(locks.items()):
         lock_bytes = await read_file(lock_path)
@@ -215,7 +232,21 @@ async def _snapshots_from_files(
                 importer=importer,
                 lockfile_path=lock_path,
                 other_manifests=other_manifests,
+                deployments=deployments,
             ))
+    for requirement_path in requirements:
+        folder = requirement_path.rpartition("/")[0]
+        body = await read_file(requirement_path)
+        if body is None:
+            raise ValueError(f"Requirements file disappeared at {requirement_path}; retry the scan")
+        project_id = f"{repo}::{folder or 'root'}#pip"
+        results.append(Snapshot(
+            repo=project_id, sha=sha, lockfile={}, package_json={}, owner=owner, services=[],
+            source=f"https://github.com/{repo}/blob/{sha}/{requirement_path}",
+            lockfile_text=body.decode("utf-8", errors="replace"), manager="pip",
+            project_path=folder, lockfile_path=requirement_path,
+            other_manifests=other_manifests, deployments=deployments,
+        ))
     if not results:
         raise ValueError("No supported projects were found in the lockfiles")
     return results
@@ -259,15 +290,21 @@ async def _fetch_public_projects_archive(repo: str) -> list[Snapshot]:
         return await _snapshots_from_files(repo, sha, set(entries), read_file)
 
 
-async def fetch_public_projects(repo: str) -> list[Snapshot]:
+async def fetch_public_projects(repo: str, *, force_refresh: bool = True) -> list[Snapshot]:
     repo = normalize_repo(repo)
+    cached = _project_cache.get(repo)
+    if not force_refresh and cached and time.monotonic() - cached[0] < 120:
+        return cached[1]
     try:
-        return await _fetch_public_projects_api(repo)
+        result = await _fetch_public_projects_api(repo)
     except httpx.HTTPStatusError as exc:
         limited = exc.response.headers.get("X-RateLimit-Remaining") == "0" or "rate limit" in exc.response.text.lower()
         if exc.response.status_code == 429 or (exc.response.status_code == 403 and limited):
-            return await _fetch_public_projects_archive(repo)
-        raise
+            result = await _fetch_public_projects_archive(repo)
+        else:
+            raise
+    _project_cache[repo] = (time.monotonic(), result)
+    return result
 
 
 async def fetch_public_repo(repo: str) -> Snapshot:

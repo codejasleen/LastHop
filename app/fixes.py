@@ -15,7 +15,7 @@ import httpx
 
 from .advisories import Advisory, is_affected
 from .lockfile import parse_lockfile
-from .sources import Snapshot, fetch_public_repo
+from .sources import Snapshot, fetch_public_projects
 
 
 PROPOSALS: dict[str, "Proposal"] = {}
@@ -31,14 +31,15 @@ class Proposal:
     before: str
     after: str
     lockfile_text: str
+    lockfile_path: str
     path: list[str]
     expires_at: float
 
 
 def lockfile_refresh_plan(snapshot: Snapshot, advisory: Advisory, name: str) -> dict:
     """Prove the patched version fits the immediate parent's declared range."""
-    if snapshot.manager != "npm" or snapshot.project_path:
-        raise ValueError("Automated lockfile refresh currently requires a root npm project")
+    if snapshot.manager != "npm":
+        raise ValueError("Automated lockfile refresh currently requires an npm project")
     matches = [d for d in parse_lockfile(snapshot.lockfile) if d.name == name
                and any(p.name == name and is_affected(d.version, p.vulnerable_range) is True for p in advisory.packages)]
     if len(matches) != 1:
@@ -66,8 +67,6 @@ def _safe_target(advisory: Advisory, name: str, installed: str) -> str:
 
 
 async def build_preview(snapshot: Snapshot, advisory: Advisory, package: str, path: list[str]) -> tuple[str, dict]:
-    if snapshot.repo.startswith("demo/"):
-        raise ValueError("Synthetic demo repos cannot receive real pull requests")
     plan = lockfile_refresh_plan(snapshot, advisory, package)
     installed, target = plan["before"], plan["target"]
     if plan["strategy"] != "lockfile_refresh":
@@ -118,11 +117,13 @@ async def build_preview(snapshot: Snapshot, advisory: Advisory, package: str, pa
     after = next((d.version for d in remaining if d.path == plan["dependency_path"]), remaining[0].version)
     if updated_text == original:
         raise ValueError("npm produced no lockfile change")
-    diff_lines = list(difflib.unified_diff(original.splitlines(), updated_text.splitlines(), fromfile="a/package-lock.json", tofile="b/package-lock.json", lineterm=""))
+    diff_lines = list(difflib.unified_diff(original.splitlines(), updated_text.splitlines(),
+                                          fromfile=f"a/{snapshot.lockfile_path}", tofile=f"b/{snapshot.lockfile_path}", lineterm=""))
     if len(diff_lines) > 1000:
         raise ValueError("The lockfile change is too large for the reviewable fix preview")
     preview_id = secrets.token_urlsafe(24)
-    PROPOSALS[preview_id] = Proposal(snapshot.repo, snapshot.sha, advisory.identifier, advisory.url, package, installed, after, updated_text, path, time.time() + 1800)
+    PROPOSALS[preview_id] = Proposal(snapshot.repo, snapshot.sha, advisory.identifier, advisory.url, package,
+                                      installed, after, updated_text, snapshot.lockfile_path, path, time.time() + 1800)
     return preview_id, {"repo": snapshot.repo, "package": package, "before": installed, "after": after,
                         "strategy": "lockfile_refresh", "parent": plan["parent_name"], "declared_range": plan["declared_range"],
                         "diff": "\n".join(diff_lines), "truncated": False, "proposal_id": preview_id}
@@ -138,11 +139,13 @@ async def create_draft_pr(proposal_id: str, admin_key: str) -> str:
     proposal = PROPOSALS.get(proposal_id)
     if not proposal or proposal.expires_at < time.time():
         raise ValueError("Fix proposal expired; review a fresh diff")
-    current = await fetch_public_repo(proposal.repo)
-    if current.sha != proposal.sha:
+    root_repo = proposal.repo.split("::")[0]
+    current = next((s for s in await fetch_public_projects(root_repo) if s.repo == proposal.repo), None)
+    if current is None or current.sha != proposal.sha:
         raise ValueError("Repository changed since review; investigate and preview again")
     headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}", "User-Agent": "BlastRadius-demo"}
-    repo = proposal.repo
+    repo = root_repo
+    lock_path = quote(proposal.lockfile_path, safe="/")
     branch = f"blastradius/{proposal.advisory.lower()}-{secrets.token_hex(4)}"
     async with httpx.AsyncClient(timeout=20, headers=headers) as client:
         meta = await client.get(f"https://api.github.com/repos/{repo}")
@@ -150,11 +153,11 @@ async def create_draft_pr(proposal_id: str, admin_key: str) -> str:
         base = meta.json()["default_branch"]
         created = await client.post(f"https://api.github.com/repos/{repo}/git/refs", json={"ref": f"refs/heads/{branch}", "sha": proposal.sha})
         created.raise_for_status()
-        file = await client.get(f"https://api.github.com/repos/{repo}/contents/package-lock.json", params={"ref": proposal.sha})
+        file = await client.get(f"https://api.github.com/repos/{repo}/contents/{lock_path}", params={"ref": proposal.sha})
         file.raise_for_status()
         import base64
         updated = await client.put(
-            f"https://api.github.com/repos/{repo}/contents/package-lock.json",
+            f"https://api.github.com/repos/{repo}/contents/{lock_path}",
             json={
                 "message": f"fix: update {proposal.package} for {proposal.advisory}",
                 "content": base64.b64encode(proposal.lockfile_text.encode()).decode(),
@@ -167,7 +170,7 @@ async def create_draft_pr(proposal_id: str, admin_key: str) -> str:
         body = (
             f"## BlastRadius investigation\n\nAdvisory: {proposal.advisory} ({proposal.advisory_url})\n\n"
             f"Dependency path: `{proof}`\n\nResolved `{proposal.package}` from `{proposal.before}` to `{proposal.after}`. "
-            "Only `package-lock.json` changed. This is a draft for human review; run the repository's tests before merging.\n\n"
+            f"Only `{proposal.lockfile_path}` changed. This is a draft for human review; run the repository's tests before merging.\n\n"
             "BlastRadius checks package and declared network reachability, not function-level code reachability."
         )
         response = await client.post(

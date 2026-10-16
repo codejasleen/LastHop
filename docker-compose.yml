@@ -12,11 +12,7 @@ services:
       timeout: 3s
       retries: 12
   app:
-    image: python:3.12-slim
-    working_dir: /workspace
-    volumes:
-      - ./:/workspace
-    command: sh -c "pip install --no-cache-dir -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    build: .
     environment:
       FALKORDB_HOST: falkordb
       FALKORDB_PORT: "6379"
@@ -24,6 +20,9 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       BLASTRADIUS_ADMIN_KEY: ${BLASTRADIUS_ADMIN_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     ports:
       - "${BLASTRADIUS_BIND:-127.0.0.1}:8000:8000"
     depends_on:

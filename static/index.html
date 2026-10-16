@@ -23,33 +23,35 @@
     <main id="top">
       <header class="topbar">
         <div><div class="eyebrow">Security workspace</div><h1>Investigations</h1><p>Check a CVE against the latest commit of a public GitHub repository.</p></div>
-        <span class="top-tag">Public GitHub repos · npm / pnpm / Yarn</span>
+        <span class="top-tag">Public GitHub repos · npm / pnpm / Yarn / pinned Python</span>
       </header>
 
       <section class="workspace-grid" aria-label="Start an investigation">
         <div id="investigate" class="panel investigation-panel">
-          <div class="panel-heading"><div><div class="panel-kicker">Live GitHub scan</div><h2>Trace a vulnerability</h2></div><span class="panel-icon" aria-hidden="true">↗</span></div>
-          <p class="muted">Paste a public repo URL and a CVE. BlastRadius discovers supported lockfiles at the latest commit, builds project graphs, and returns dependency paths with available service context.</p>
+          <div class="panel-heading"><div><div class="panel-kicker">MCP investigation agent</div><h2>Trace a vulnerability</h2></div><span class="panel-icon" aria-hidden="true">↗</span></div>
+          <p class="muted">Paste a public repo URL and a CVE. The agent refreshes its lockfiles and deployment evidence, then follows graph paths across projects and services.</p>
           <form id="investigation-form" class="form-stack">
             <label for="live-repo">Public GitHub repository</label>
             <input id="live-repo" placeholder="https://github.com/owner/repo or owner/repo" required spellcheck="false" autocomplete="off">
             <label for="advisory" class="stacked-label">CVE or GitHub advisory ID</label>
             <div class="input-row"><input id="advisory" placeholder="CVE-2024-… or GHSA-…" required spellcheck="false" autocomplete="off"><button class="primary" type="submit">Scan latest <span aria-hidden="true">→</span></button></div>
-            <p class="form-hint">Finds npm, pnpm v9, and Yarn Classic lockfiles, including nested projects. No GitHub sign-in needed.</p>
+            <label for="agent-question" class="stacked-label">Ask the agent (optional)</label>
+            <input id="agent-question" placeholder="Which services can be reached, and what did we decide last time?" maxlength="500" spellcheck="false" autocomplete="off">
+            <p class="form-hint">Finds npm, pnpm v9, Yarn Classic, and pinned Python requirements in nested projects. No GitHub sign-in needed.</p>
           </form>
         </div>
 
         <div id="repos" class="panel repo-panel">
           <div class="panel-heading"><div><div class="panel-kicker">Data sources</div><h2>Repositories</h2></div><span id="repo-count" class="count">0 repos</span></div>
-          <p class="muted">Repos you scan appear here. Choose one to scan it again, or load the synthetic incident to see an affected path.</p>
+          <p class="muted">Repos you scan appear here. Start with a real multi-service example from Google’s Online Boutique.</p>
           <div id="repo-list" class="repo-list"><div class="empty-small">No repositories imported yet.</div></div>
-          <div class="actions"><button id="seed-demo" class="secondary" type="button">Run sample investigation</button></div>
+          <div class="actions"><button id="real-example" class="secondary" type="button">Try real example</button></div>
         </div>
       </section>
 
       <div class="scope-note"><strong>What this checks</strong><span>Package path in FalkorDB</span><span>Declared service exposure</span><span>Owner and prior decisions</span><small>Function-level code reachability is not measured.</small></div>
 
-      <section id="results-section" class="results-section hidden" aria-live="polite"><div class="results-header"><div><div class="panel-kicker">Investigation results</div><h2 id="results-title">Advisory impact</h2><p id="results-source" class="results-source"></p><p id="results-scope" class="results-scope hidden"></p><p id="results-summary"></p></div><span id="results-severity" class="severity"></span></div><div id="results" class="results"></div></section>
+      <section id="results-section" class="results-section hidden" aria-live="polite"><div class="results-header"><div><div class="panel-kicker">Investigation results</div><h2 id="results-title">Advisory impact</h2><p id="results-source" class="results-source"></p><p id="results-scope" class="results-scope hidden"></p><p id="results-summary"></p><p id="agent-summary" class="results-source"></p><p id="agent-trace" class="results-source"></p><p id="graph-summary" class="results-source"></p></div><span id="results-severity" class="severity"></span></div><div id="results" class="results"></div></section>
       <div id="notice" class="notice hidden" role="status"></div>
 
       <div id="fix-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="fix-title">

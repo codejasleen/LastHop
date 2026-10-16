@@ -16,6 +16,7 @@ from .advisories import Advisory, fetch_advisory, is_affected
 from .graph import GraphStore, dependency_graph
 from .fixes import build_preview, create_draft_pr, lockfile_refresh_plan
 from .module_trace import fetch_parent_trace
+from .risk_signals import assign_priority, fetch_risk_signals
 from .sources import fetch_public_projects, fetch_public_repo
 from .webhooks import verify_push
 
@@ -32,7 +33,6 @@ class IngestRequest(BaseModel):
 class InvestigationRequest(BaseModel):
     advisory: str = Field(min_length=8, max_length=30)
     repo: str | None = None
-    demo_only: bool = False
 
 
 class LiveScanRequest(BaseModel):
@@ -56,6 +56,17 @@ class PreviewRequest(BaseModel):
 class ApproveRequest(BaseModel):
     proposal_id: str
     admin_key: str
+
+
+class AgentRequest(BaseModel):
+    question: str = Field(min_length=5, max_length=500)
+    repo: str | None = None
+    advisory: str | None = None
+
+
+class ProvenanceRequest(BaseModel):
+    repo: str
+    dependency_id: str
 
 
 def store() -> GraphStore:
@@ -84,12 +95,40 @@ def repositories() -> list[dict]:
     return store().repositories()
 
 
-@app.post("/api/demo/seed")
-def seed_demo() -> dict:
-    from demo.fixtures import demo_snapshots
+@app.post("/api/agent")
+async def agent_investigation(request: AgentRequest) -> dict:
+    from .agent import investigate
+
+    try:
+        return await investigate(request.question, request.repo, request.advisory)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Agent investigation failed: {exc.__class__.__name__}: {exc}") from exc
+
+
+@app.post("/api/provenance")
+async def provenance(request: ProvenanceRequest) -> dict:
+    from .provenance import trace_lockfile_pin
 
     graph = store()
-    return {"ingested": [graph.ingest(snapshot) for snapshot in demo_snapshots()]}
+    repo_record = next((row for row in graph.repositories() if row["repo"] == request.repo), None)
+    if not repo_record:
+        raise HTTPException(404, "Repository is not in the graph")
+    if not request.dependency_id.startswith(request.repo + ":"):
+        raise HTTPException(400, "Dependency ID does not belong to the selected project")
+    if cached := graph.saved_provenance(request.dependency_id):
+        return cached
+    snapshot = next((s for s in await fetch_public_projects(request.repo.split("::")[0], force_refresh=False) if s.repo == request.repo), None)
+    if snapshot is None or snapshot.sha != repo_record["sha"]:
+        raise HTTPException(409, "Repository changed since scan; scan it again before tracing provenance")
+    if snapshot.manager != "npm":
+        raise HTTPException(400, "Introducing-commit tracing currently supports npm lockfiles")
+    package_path = request.dependency_id.removeprefix(request.repo + ":")
+    item = snapshot.lockfile.get("packages", {}).get(package_path, {})
+    evidence = await trace_lockfile_pin(snapshot, package_path, item.get("version", ""))
+    graph.save_provenance(request.repo, request.dependency_id, evidence)
+    return evidence
 
 
 @app.post("/api/repos/ingest")
@@ -101,7 +140,8 @@ async def ingest_repo(request: IngestRequest) -> dict:
         graph = store()
         ingested = [graph.ingest(snapshot) for snapshot in snapshots]
         graph.prune_missing_projects(snapshots[0].repo.split("::")[0], {snapshot.repo for snapshot in snapshots})
-        return {"ingested": ingested}
+        deployment = graph.ingest_deployments(snapshots[0].repo.split("::")[0], snapshots)
+        return {"ingested": ingested, "deployment": deployment}
     except (ValueError, LookupError) as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
@@ -123,7 +163,8 @@ async def github_push(request: Request) -> dict:
             dependency_graph(snapshot)
         ingested = [graph.ingest(snapshot) for snapshot in snapshots]
         graph.prune_missing_projects(repo, {snapshot.repo for snapshot in snapshots})
-        return {"refreshed": True, "snapshots": ingested}
+        deployment = graph.ingest_deployments(repo, snapshots)
+        return {"refreshed": True, "snapshots": ingested, "deployment": deployment}
     except PermissionError as exc:
         raise HTTPException(401, str(exc)) from exc
     except ValueError as exc:
@@ -131,10 +172,16 @@ async def github_push(request: Request) -> dict:
 
 
 def _verdict(paths: list[dict], checked: list[dict], context: dict, uncertain: bool) -> tuple[str, str]:
+    if context.get("manager") == "pip":
+        if paths:
+            if any(s["exposure"] == "public" and s["public_route"] for s in context["services"]):
+                return "declared_exposed", "A pinned Python requirement is affected, and a declared public path reaches this service. Installation and function-level use are unverified."
+            return "declared_exposure_unknown", "A pinned Python requirement is affected; deployment exposure or actual installation is not established."
+        return "insufficient_evidence", "No affected Python pin was observed. requirements.txt does not prove transitive dependency completeness, so absence is inconclusive."
     if paths:
         services = context["services"]
         if any(s["exposure"] == "public" and s["public_route"] for s in services):
-            return "affected_exposed", "A vulnerable dependency path reaches a repo with a declared public service."
+            return "affected_exposed", "The affected package is installed in a service with a declared path from a public entry point. This does not prove exploitability."
         if services and all(s["exposure"] == "internal" for s in services):
             return "affected_internal_declared", "The deployment manifest declares only internal services."
         return "affected_exposure_unknown", "A vulnerable dependency path exists; network exposure is not established."
@@ -151,9 +198,11 @@ def investigate_one(graph: GraphStore, repo: str, advisory: Advisory) -> dict:
     checked_paths: list[dict] = []
     uncertain = False
     fix_candidates = []
-    for package in advisory.packages:
+    ecosystem = "PyPI" if context.get("manager") == "pip" else "npm"
+    eligible = [package for package in advisory.packages if package.ecosystem == ecosystem]
+    for package in eligible:
         for path in graph.paths_to(repo, package.name):
-            match = is_affected(path["version"], package.vulnerable_range)
+            match = is_affected(path["version"], package.vulnerable_range, package.ecosystem)
             path_info = {
                 "package": package.name,
                 "version": path["version"],
@@ -161,15 +210,17 @@ def investigate_one(graph: GraphStore, repo: str, advisory: Advisory) -> dict:
                 "affected": match,
                 "path": [node.get("name") or node.get("id") for node in path["nodes"]],
                 "dependency_id": path["dependency_id"],
+                "evidence_kind": "declared_pin" if context.get("manager") == "pip" else "installed_lockfile",
             }
             checked_paths.append(path_info)
             if match is True:
                 vulnerable_paths.append(path_info)
-                if package.first_patched:
+                if package.first_patched and context.get("manager") != "pip":
                     fix_candidates.append({"package": package.name, "first_patched": package.first_patched, "direct": len(path["nodes"]) == 2})
             elif match is None:
                 uncertain = True
-    verdict, explanation = _verdict(vulnerable_paths, checked_paths, context, uncertain)
+    verdict, explanation = (_verdict(vulnerable_paths, checked_paths, context, uncertain) if eligible else
+                            ("not_applicable", f"This advisory has no {ecosystem} package mapping for this project."))
     graph.link_advisory(advisory.identifier, advisory.summary, [p["dependency_id"] for p in vulnerable_paths])
     return {
         "repo": repo,
@@ -181,7 +232,8 @@ def investigate_one(graph: GraphStore, repo: str, advisory: Advisory) -> dict:
         "services": context["services"],
         "prior_decisions": context["decisions"],
         "fix_candidates": fix_candidates,
-        "fix_supported": context.get("manager", "npm") == "npm" and not context.get("project_path"),
+        "fix_supported": context.get("manager", "npm") == "npm",
+        "provenance_supported": context.get("manager", "npm") == "npm",
     }
 
 
@@ -216,11 +268,6 @@ async def enrich_live_result(graph: GraphStore, snapshot, advisory: Advisory, re
             except (ValueError, httpx.HTTPError, OSError, KeyError, tarfile.TarError):
                 result["module_evidence"].append({"status": "unavailable", "parent": by_path[parent_path].name,
                                                   "scope": "Package source could not be inspected; no module-level conclusion was made."})
-    statuses = {row["status"] for row in result["module_evidence"]}
-    if "runtime_static_path" in statuses:
-        result["priority"] = "P1" if result["verdict"] == "affected_exposed" else "P2"
-    elif "cli_only_static_path" in statuses:
-        result["priority"] = "P3"
 
 
 @app.post("/api/investigate")
@@ -228,18 +275,17 @@ async def investigate(request: InvestigationRequest) -> dict:
     try:
         advisory = await fetch_advisory(request.advisory)
         if not advisory.packages:
-            raise ValueError("This advisory has no npm package mapping, so a dependency verdict is unavailable")
+            raise ValueError("This advisory has no supported npm/PyPI package mapping, so a dependency verdict is unavailable")
         graph = store()
         repos = graph.repositories()
         selected = [
             r["repo"] for r in repos
             if (request.repo is None or r["repo"] == request.repo)
-            and (not request.demo_only or r["repo"].startswith("demo/"))
         ]
         if not selected:
             raise HTTPException(404, "No matching repository has been ingested")
         results = [investigate_one(graph, repo, advisory) for repo in selected]
-        order = {"affected_exposed": 0, "affected_exposure_unknown": 1, "affected_internal_declared": 2, "insufficient_evidence": 3, "not_affected_version": 4, "not_present": 5}
+        order = {"affected_exposed": 0, "declared_exposed": 1, "affected_exposure_unknown": 2, "declared_exposure_unknown": 3, "affected_internal_declared": 4, "insufficient_evidence": 5, "not_affected_version": 6, "not_present": 7, "not_applicable": 8}
         results.sort(key=lambda row: (order[row["verdict"]], row["repo"]))
         return {
             "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url},
@@ -259,28 +305,32 @@ async def scan_live(request: LiveScanRequest) -> dict:
     try:
         advisory = await fetch_advisory(request.advisory)
         if not advisory.packages:
-            raise ValueError("This advisory has no npm package mapping, so a dependency verdict is unavailable")
+            raise ValueError("This advisory has no supported npm/PyPI package mapping, so a dependency verdict is unavailable")
         snapshots = await fetch_public_projects(request.repo)
         for snapshot in snapshots:
             dependency_graph(snapshot)
         graph = store()
         imported = [graph.ingest(snapshot) for snapshot in snapshots]
         graph.prune_missing_projects(snapshots[0].repo.split("::")[0], {snapshot.repo for snapshot in snapshots})
+        deployment = graph.ingest_deployments(snapshots[0].repo.split("::")[0], snapshots)
+        signals = await fetch_risk_signals(advisory.identifier)
         results = []
         for snapshot in snapshots:
             result = investigate_one(graph, snapshot.repo, advisory)
             await enrich_live_result(graph, snapshot, advisory, result)
+            result["priority"], result["priority_reasons"] = assign_priority(result, signals)
             results.append(result)
-        order = {"affected_exposed": 0, "affected_exposure_unknown": 1, "affected_internal_declared": 2, "insufficient_evidence": 3, "not_affected_version": 4, "not_present": 5}
+        order = {"affected_exposed": 0, "declared_exposed": 1, "affected_exposure_unknown": 2, "declared_exposure_unknown": 3, "affected_internal_declared": 4, "insufficient_evidence": 5, "not_affected_version": 6, "not_present": 7, "not_applicable": 8}
         results.sort(key=lambda row: (order[row["verdict"]], row["repo"]))
         return {
             "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url},
+            "risk_signals": signals,
             "results": results,
             "source": {"repo": snapshots[0].repo.split("::")[0], "sha": snapshots[0].sha, "scanned_at": datetime.now(timezone.utc).isoformat(),
                        "dependencies": sum(row["dependencies"] for row in imported), "projects": len(snapshots),
                        "managers": sorted({snapshot.manager for snapshot in snapshots}),
                        "project_paths": [snapshot.project_path or "." for snapshot in snapshots],
-                       "other_manifests": list(snapshots[0].other_manifests)},
+                       "other_manifests": list(snapshots[0].other_manifests), "deployment": deployment},
         }
     except HTTPException:
         raise
@@ -325,7 +375,9 @@ async def preview_fix(request: PreviewRequest) -> dict:
         ]
         if not affected:
             raise ValueError("No affected dependency path supports an automated fix")
-        snapshot = await fetch_public_repo(request.repo)
+        snapshot = next((s for s in await fetch_public_projects(request.repo.split("::")[0]) if s.repo == request.repo), None)
+        if snapshot is None:
+            raise ValueError("Project is no longer present at the latest commit")
         if snapshot.sha != repo_record["sha"]:
             raise ValueError("Repository changed since ingestion; import it again before proposing a fix")
         _, preview = await build_preview(snapshot, advisory, request.package, [node.get("name") or node.get("id") for node in affected[0]["nodes"]])

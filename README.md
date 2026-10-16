@@ -1,14 +1,14 @@
 # BlastRadius
 
-**Question:** A CVE just dropped. Which repositories actually contain the affected package, which declared services are public, who owns them, and what should be fixed first?
+**Track:** Agents That Act on Connected Data. The graph also retains human decisions for later review.
 
-BlastRadius imports public npm repository evidence into **FalkorDB**, walks repository-specific dependency paths, joins declared service exposure and ownership, and returns a verdict with its proof path. For a bounded npm case it also traces static imports from the immediate parent package's main and CLI entries. A compatible direct or transitive dependency fix can be reviewed as a targeted lockfile diff and, with an approval key, submitted as a **draft pull request**. No LLM is needed for any verdict or action.
+BlastRadius asks: when a CVE lands, which installed versions reach which services, how can a public request reach those services, what did the team decide before, and what fix can a human review? Its agent calls bounded MCP evidence tools backed by FalkorDB. The browser shows the tool trace, dependency path, declared network path, exploit signals, and a reviewable fix when one can be verified.
 
-This is a working college-selection prototype. The included three-repo incident is explicitly **synthetic**; the same importer also reads real public GitHub repos. Its graph model, ingestion, queries, and UI are implemented here. Any later hackathon submission must be checked against the event's work-timing and disclosure rules.
+The live example uses [Google Online Boutique](https://github.com/GoogleCloudPlatform/microservices-demo) and [CVE-2026-12143](https://github.com/advisories/GHSA-hmw2-7cc7-3qxx). At the tested commit its two Node projects contain `form-data@2.5.5`. Kubernetes manifests declare a `frontend-external` LoadBalancer and service calls to both projects. [The comparison with npm audit](eval/online_boutique.md) records the exact tested commit. The latest commit can change; each UI scan refreshes it.
 
-## Run
+## Run locally
 
-With Docker Desktop running:
+With Docker Desktop, Python 3.11+, and Git (for provenance):
 
 ```powershell
 docker compose up -d falkordb
@@ -17,80 +17,85 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Open <http://127.0.0.1:8000>. Or run the whole stack with `docker compose up` (the app container installs Python requirements on startup). The FalkorDB Browser is at <http://127.0.0.1:3000>.
+Open <http://127.0.0.1:8000>. The FalkorDB Browser is at <http://127.0.0.1:3000>. **Try real example** scans Online Boutique. A public repo needs no sign-in. `GITHUB_TOKEN` is optional for higher API limits and required, with write permission to the target repo, for draft PR creation. When anonymous API quota is exhausted, source ingestion falls back to a bounded GitHub archive.
 
-1. Paste a public GitHub repository URL (or `owner/repo`) and enter a CVE or GHSA, then click **Scan latest**. Each scan fetches the current default-branch commit, discovers supported projects, and rebuilds their separate graph snapshots.
-2. For a tested affected real example, use `mercadopago/card-payment-bricks-sample-node` and `CVE-2021-44906`. The current committed lockfile traces `hbs → handlebars → minimist@1.2.5`; the Handlebars package main has no static import path to minimist, while `bin/handlebars:138` does. Review the targeted lockfile refresh to minimist 1.2.6. This is evidence about static imports in Handlebars, not proof that the application never executes its CLI.
-3. Click **Run sample investigation** for a clearly synthetic affected case: a public storefront reached through `web-framework → render-kit`, an affected internal service, and a repo where the package is absent.
+`docker compose up --build` runs both the database and app in containers. The app image includes Git for the provenance fallback.
 
-The scanner discovers **npm `package-lock.json` v2/v3**, **pnpm `pnpm-lock.yaml` v9**, and **Yarn Classic `yarn.lock` v1** at any directory, including nested pnpm importers. Each project has its own graph identity and result card. It refuses incomplete or unsupported paths instead of returning a false "not present" result. Private repos, npm/Yarn workspace lockfiles, Yarn Berry/Bun, pnpm workspace links and non-registry references, other ecosystems, and function-level call paths are not supported yet. A public GitHub repo needs no sign-in; optional `GITHUB_TOKEN` raises GitHub API limits and is required for draft PR creation.
+Launch the MCP server separately for an external MCP client:
 
-Run the focused checks with `.\.venv\Scripts\python.exe -m pytest -q`.
+```powershell
+.\.venv\Scripts\python.exe -m app.mcp_server
+```
 
-For a reproducible package-only versus graph comparison, run `.\.venv\Scripts\python.exe -m eval.ablation`. This uses the synthetic three-repo case: package matching alerts on two repos, while graph plus declared exposure elevates one public service. It is a demonstration of decision differences, not a real-world accuracy measurement.
+It uses stdio and exposes `scan_public_repo`, `advisory_fanout`, `exposure_evidence`, `decision_memory`, `service_bridges`, and `introducing_commit`. `POST /api/agent` selects these tools based on the question, then returns its trace and evidence. With `GROQ_API_KEY`, `GEMINI_API_KEY`, or `OPENROUTER_API_KEY`, a model writes a short summary from bounded tool facts. If keys are absent or fail, the deterministic summary remains available. The model never receives database credentials or arbitrary Cypher/write access.
 
-## Evidence and graph model
+The scanner discovers npm `package-lock.json` v2/v3, pnpm v9, Yarn Classic v1, and pinned Python `requirements.txt` entries in nested projects. Python requirements provide positive pin evidence only; they do not prove the installed or transitive set is complete. Kubernetes YAML in `kubernetes-manifests`, `k8s`, `kubernetes`, or `deploy` directories is parsed for Deployments, Services, Ingresses, LoadBalancers, and `*_ADDR`/`*_URL`/`*_HOST` service addresses. These are **declared** deployment paths, not observed runtime traffic.
+
+Run checks with `.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider`. Reproduce the real comparison with `.\.venv\Scripts\python.exe -m eval.real` (requires npm and network access).
+
+For a second real ecosystem check, scan Online Boutique with [CVE-2026-97687](https://github.com/urllib3/urllib3/security/advisories/GHSA-8988-9cw3-xx77). Its Python requirements contain affected `urllib3` pins at the tested commit. The result distinguishes declared public paths from unavailable deployment evidence and marks actual installation as unverified.
+
+## Graph model and queries
 
 ```text
+(Advisory)-[:AFFECTS_VERSION]->(PackageVersion)<-[:INSTANCE_OF]-(Dependency)
 (Advisory)-[:AFFECTS]->(Dependency)
 (Repo)-[:DEPENDS_ON]->(Dependency)-[:DEPENDS_ON*]->(Dependency)
-(Repo)-[:RUNS]->(Service)-[:EXPOSES]->(Exposure)
+(Repo)-[:RUNS]->(Service)
+(Internet)-[:REACHES]->(Exposure)-[:ROUTES_TO]->(Service)-[:CALLS*]->(Service)
 (Repo)-[:OWNED_BY]->(Owner)
-(Repo)-[:HAS_DECISION]->(Decision)
+(Repo)-[:HAS_DECISION]->(Decision {snapshot_sha})
+(Person)-[:AUTHORED]->(Commit)-[:INTRODUCED_PIN]->(Dependency)
+(PullRequest)-[:CONTAINS]->(Commit)
+(Person)-[:APPROVED]->(PullRequest)
 (Dependency)-[:HAS_MODULE_ANALYSIS]->(ModuleAnalysis)-[:MAIN_ENTRY|CLI_ENTRY]->(ModuleFile)
 (ModuleFile)-[:IMPORTS_MODULE]->(ModuleFile)-[:IMPORTS_PACKAGE]->(Dependency)
 ```
 
-Each `Dependency` ID includes the project identity and exact installed package key. This prevents one repo or monorepo project pin from contaminating another result. The npm importer parses production and optional dependencies in lockfile v2/v3, resolves nested and hoisted packages, and refuses missing referenced packages. The pnpm v9 importer follows exact `importers` and `snapshots` keys, including peer suffixes. The Yarn Classic importer uses `package.json` production roots and exact selectors from `yarn.lock`. Workspace links and unresolved selectors currently stop the scan with an explicit unsupported-path error. Ingestion replaces one project snapshot at a time and uses `UNWIND … MERGE` batches for nodes and edges. There is no ordinary database standing behind the verdicts.
+Each `Dependency` is a project-specific installed instance. `PackageVersion` is shared by npm name and version, allowing one advisory to fan out across projects without letting one repo's stale pin contaminate another. Ingestion uses `UNWIND … MERGE` batches and replaces each project's current snapshot. `Decision` nodes survive reingestion and carry the commit SHA at which they were recorded; the agent flags a decision as stale when the repository SHA changes. An unrelated commit can also trigger review.
 
-The core bounded read query is:
+The central bounded FalkorDB read queries are:
 
 ```cypher
 MATCH p=(r:Repo {id:$repo})-[:DEPENDS_ON*1..12]->(d:Dependency {name:$name})
 RETURN p, d.version, d.id ORDER BY length(p) LIMIT 50
 ```
 
-It runs through `GRAPH.RO_QUERY` with a 3-second timeout. The path object returned by FalkorDB is displayed in the result card. Other read-only queries fetch `(Repo)-[:RUNS]->(Service)-[:EXPOSES]->(Exposure)`, ownership, and previous `Decision` nodes. Advisory ranges are checked with npm semver, never lexical string comparison. The LLM is absent from this prototype, and never receives graph credentials.
-
-For a vulnerable npm dependency, BlastRadius downloads the immediate parent's bounded public npm tarball, verifies it against the committed lockfile integrity, and records static `require()`/`import` edges in FalkorDB. The module status is then read from graph traversals starting at the package `main` and `bin` entries:
+```cypher
+MATCH (a:Advisory {id:$id})-[:AFFECTS_VERSION]->(p:PackageVersion)
+      <-[:INSTANCE_OF]-(d:Dependency)
+MATCH path=(r:Repo)-[:DEPENDS_ON*1..12]->(d)
+RETURN r.id, p.name, p.version, length(path), r.sha
+ORDER BY r.id, length(path) LIMIT 100
+```
 
 ```cypher
-MATCH (a:ModuleAnalysis {id:$id})-[:MAIN_ENTRY]->(start:ModuleFile),
-      (a)-[:ANALYZES]->(target:Dependency)
-MATCH p=(start)-[:IMPORTS_MODULE*0..16]->(last:ModuleFile)-[imp:IMPORTS_PACKAGE]->(target)
-RETURN last.file, imp.line ORDER BY length(p) LIMIT 1
+MATCH (r:Repo {id:$repo})-[:RUNS]->(s:Service), (i:Internet {id:'internet'})
+WITH s, shortestPath((i)-[:REACHES|ROUTES_TO|CALLS*1..12]->(s)) AS p
+RETURN s.id, p LIMIT 20
 ```
 
-The same bounded query from `CLI_ENTRY` distinguishes the Handlebars case. This is **static module-level evidence within the immediate parent package**. Dynamic imports, build transforms, app entry points, scripts, and CLI execution can make an absent path inconclusive. The P3 label on the Handlebars example is a provisional review priority, not a safety verdict.
-
-The app reports **package not present**, **version unaffected**, **affected with declared public route**, **affected with declared internal service**, or **exposure unknown** separately. It checks package and declared network reachability. It does **not** establish function-level code reachability or observe runtime traffic. The `blast-radius.json` exposure claim is repository-supplied evidence, so production use should corroborate it with deployment and cloud inventory.
-
-## Public repo evidence
-
-The live scan reads the default branch SHA and Git tree, discovers supported lockfiles, and reads each project's `package.json`, optional root `CODEOWNERS`, and optional project `blast-radius.json`. If GitHub's anonymous API quota is exhausted, it reads a bounded public source archive from GitHub instead; the archive must identify the exact commit SHA. CVE lookup then falls back to OSV's public advisory API. It refuses private repos, truncated Git trees, archives over 30 MB, more than 20 lockfiles, or more than 30 projects. The UI shows the exact commit SHA and names any root manifests outside this scanner's scope (for example `go.mod`). A manifest can declare service exposure:
-
-```json
-{
-  "services": [
-    {"name": "storefront", "exposure": "public", "public_route": "https://store.example.org"},
-    {"name": "worker", "exposure": "internal"}
-  ]
-}
+```cypher
+CALL algo.betweenness({nodeLabels:['Service'], relationshipTypes:['CALLS']})
+YIELD node, score
+WITH node, score WHERE node.deployment_repo=$repo
+RETURN node.name, score ORDER BY score DESC LIMIT 20
 ```
 
-Without this evidence, exposure is **unknown**. Pressing **Scan latest** always refreshes the repository. A signed GitHub `push` webhook sent to `/api/webhooks/github` can also refresh an already-scanned public repo when its default branch changes; set `GITHUB_WEBHOOK_SECRET` and expose a secured webhook URL before enabling it. The webhook does not create PRs.
+Reads use FalkorDB `GRAPH.RO_QUERY` with a 3-second timeout and caps. `algo.betweenness` ranks declared service-call bridges; it is context, not an exploitability score. Advisory ranges use npm semver. The bounded module trace records static imports in the immediate parent package's main and CLI entries as graph edges. Dynamic imports and app execution are outside its proof scope.
 
-## Draft PR gate
+## Risk, memory, provenance, and action
 
-For a single affected **direct or transitive dependency in a root npm project**, BlastRadius checks the first patched version against the immediate parent's declared range. If it fits and the patched package has the same dependency metadata, BlastRadius obtains the exact tarball URL and integrity from the public npm registry and changes only that package's lockfile records. It checks the new version against the advisory, shows the diff, then waits for a human to enter `BLASTRADIUS_ADMIN_KEY`. With `GITHUB_TOKEN` configured for Contents and Pull requests write access **to that repository**, approval creates a branch and **draft PR**. It never merges. It rejects a stale graph snapshot if the default branch moved after review. Nested npm, pnpm, multiple affected installed copies, out-of-range upgrades, dependency-metadata changes, and synthetic repositories remain manual-review cases. No PR is created for the public Mercadopago example without repository write access.
+For CVEs, BlastRadius fetches the current [CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) and [FIRST EPSS score](https://api.first.org/epss/). Missing lookups remain **unknown**. Priority uses public entry evidence, bounded module traces, KEV, and EPSS. CVSS remains advisory context. A public service path does not prove the vulnerable function can be exploited; a CLI-only static trace does not prove the app never invokes the CLI.
 
-Keep credentials in your local environment or an untracked `.env`; never commit them. The local Docker binding is `127.0.0.1` by default. Put authentication and HTTPS in front of the app before exposing it to other users. GitHub App installation and production authorization are future work; this MVP uses selected public repos and an optional GitHub token for writing a PR.
+**Trace introducing commit** checks which lockfile commit changed the exact installed package key to its current vulnerable version. It uses GitHub's commit, associated PR, and review APIs. If anonymous API quota is exhausted, bounded shallow public Git history can verify the commit; a PR number parsed from its title is labeled inferred and reviewers remain unknown. `Commit`, `PullRequest`, and anonymous role-only `Person` nodes preserve graph relationships without storing author or reviewer names in FalkorDB. Public names are shown transiently from source evidence when available.
 
-## Demo script (2 minutes)
+For npm direct or transitive dependencies in root or nested projects, BlastRadius checks whether the first patched version fits the immediate parent's declared range. If it fits and package dependency metadata is unchanged, it builds a targeted lockfile diff using verified npm registry metadata. A human reviews the diff and enters `BLASTRADIUS_ADMIN_KEY`; with a write-capable `GITHUB_TOKEN`, the server opens a **draft** PR and never merges it. Out-of-range fixes, changed dependency metadata, multiple affected copies, and non-npm lockfiles require manual review. No PR is opened against public examples without write access.
 
-1. **The problem (15s):** A package advisory alone cannot answer whether a vulnerable version reaches a public service.
-2. **Live graph (45s):** Run the synthetic incident and follow the storefront's dependency path and public route. Compare its result to the internal service and absent package.
-3. **Real input (35s):** Scan `mercadopago/card-payment-bricks-sample-node` with `CVE-2021-44906`. Show the real dependency path, the package-main versus CLI module evidence, and the provisional review priority.
-4. **Action (25s):** Open the 28-line targeted transitive lockfile diff. Explain that draft PR creation requires repository write access and human approval; do not claim a PR was opened for Mercadopago.
+To show a real reviewable transitive action, scan `mercadopago/card-payment-bricks-sample-node` with `CVE-2021-44906`. Its tested lockfile has `hbs → handlebars → minimist@1.2.5`; the compatible 1.2.6 update produces a targeted lockfile diff. The module trace finds the static minimist import in Handlebars' CLI, not its main entry. That is a bounded observation, not a proof that the CLI never runs.
 
-The result is strongest when the judge sees the same advisory lead to different evidence-backed actions. The demo never presents synthetic data as a live incident.
+## Limits and submission transparency
+
+Only public repositories are imported. Python coverage is limited to pinned `requirements.txt` entries; Go, Java, and other ecosystems are not scanned for package vulnerabilities. Package-level and declared network reachability are checked; function-level reachability, runtime traffic, cloud firewalls, and actual exploitation are not measured. Manifest claims may be stale. The app binds to localhost by default and needs authentication/HTTPS before public deployment.
+
+AI coding assistance was used for implementation and review. The owner must verify and be able to explain the graph model, queries, decisions, and demo. This repository has substantive pre-event prototype commits from October 11 and 14, 2026; [Graph Hacks rules](https://www.wemakedevs.org/hackathons/falkordb/rules) say main coding and design must begin after October 15. **Eligibility of this repo as a hackathon submission needs an organizer ruling.** October 15–16 work adds the module trace, MCP agent, real deployment graph, graph fan-out and algorithm, exploit signals, provenance, and real-repo evaluation.

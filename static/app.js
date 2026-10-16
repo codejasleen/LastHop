@@ -21,6 +21,17 @@ const TOOL_DESC = {
   graph_blast_radius: 'One Cypher query across every ingested repo: shared package version → dependency paths → internet exposure → past decisions',
   service_bridges: 'Ran algo.betweenness over the service call graph',
   advisory_fanout: 'Counted every project the advisory reaches across the graph',
+  recall_investigations: 'Read earlier investigations of this repo from the graph (memory across sessions)',
+  cut_points: 'Counted, per package, how many vulnerable dependency paths pass through it',
+  query_graph: 'Ran the agent\'s own read-only Cypher query on FalkorDB',
+  graph_schema: 'Read the graph\'s labels, relationships and loaded repos',
+  decision_memory: 'Read team decisions recorded for this project and advisory',
+  introducing_commit: 'Traced the commit that introduced the vulnerable pin',
+};
+const CHOSEN_BY = {
+  llm: ['label done', 'chosen by the agent'],
+  guard: ['label', 'added by a safety guard'],
+  fallback: ['label attention', 'fixed fallback order'],
 };
 const HISTORY_KEY = 'blastradius.investigations';
 
@@ -547,15 +558,26 @@ function renderAgent(entry) {
   const steps = d.tool_trace.map(step => {
     const args = Object.entries(step.arguments || {}).map(([k, v]) => `${k}: ${String(v).includes('::') ? projectName(String(v)) : v}`).join(' · ');
     const ok = step.status === 'ok';
-    const raw = evidenceFor(step, ev);
+    let raw = evidenceFor(step, ev);
+    if (step.output) { try { raw = JSON.parse(step.output); } catch { raw = step.output; } }
+    const [chipClass, chipText] = CHOSEN_BY[step.selected_by] || CHOSEN_BY.fallback;
     return `<li class="tl-item"><div class="tl-badge ${ok ? 'ok' : 'err'}">${ok ? '✓' : '✕'}</div><div class="tl-body">
-      <div class="tl-title"><code>${esc(step.tool)}</code> <span class="muted small">${esc(args)}</span></div>
+      <div class="tl-title"><code>${esc(step.tool)}</code> <span class="${chipClass}">${chipText}</span> <span class="muted small">${esc(args)}</span></div>
+      ${step.reason ? `<div class="tl-reason">“${esc(step.reason)}”</div>` : ''}
       <div class="tl-sub">${esc(TOOL_DESC[step.tool] || '')}</div>
       ${raw ? `<details class="raw"><summary>Tool output</summary><pre>${esc(JSON.stringify(raw, null, 2).slice(0, 5000))}</pre></details>` : ''}
     </div></li>`;
   }).join('');
   const source = d.summary_source === 'deterministic' ? 'rule-based (no LLM call)' : esc(d.summary_source);
-  $('tab-agent').innerHTML = `<ol class="timeline">
+  const a = d.agent || {};
+  const recalled = ev.recall_investigations?.previous || [];
+  const banner = a.mode === 'llm'
+    ? `<div class="callout accent-callout" style="margin:0 0 12px"><b>Agent run:</b> ${esc(a.model)} chose ${a.chosen_by_llm} of ${a.steps} tool calls itself, reading the FalkorDB graph as its context.
+       ${recalled.length ? ` It recalled ${recalled.length} earlier investigation${recalled.length === 1 ? '' : 's'} of this repo from the graph.` : ' No earlier investigation of this repo was in memory.'}
+       ${a.saved_investigation ? ' This run was saved to the graph as an Investigation node.' : ''}</div>`
+    : a.mode === 'fallback'
+      ? `<div class="callout attention" style="margin:0 0 12px"><b>Fallback run:</b> no LLM could take a turn (${esc(a.reason || '')}), so a fixed tool order was used.</div>` : '';
+  $('tab-agent').innerHTML = banner + `<ol class="timeline">
     <li class="tl-item"><div class="tl-badge user">?</div><div class="tl-body"><div class="comment">
       <div class="comment-head"><b>You</b> asked</div><div class="comment-body">${esc(entry.question)}</div></div></div></li>
     ${steps}
@@ -642,7 +664,7 @@ async function provenance(idx, button) {
 const TAB_INTRO = {
   overview: 'One row per scanned project: ✕ affected and reachable from the internet, ! affected but not proven reachable, ✓ not affected. Open a row to see its evidence.',
   graph: 'How the internet reaches each affected service, and how the vulnerable package reaches that service, drawn from FalkorDB. Below it, the single Cypher query that computes the blast radius across every repo in the graph.',
-  agent: 'Every MCP tool call made for this investigation, in order, with its raw output, then the written answer. The answer may only use facts from these tool outputs.',
+  agent: 'What the agent decided: each MCP tool it chose, why, and exactly what that tool returned from the graph, then its answer. The answer may only use facts from these outputs.',
   files: 'Proposed fixes as lockfile diffs. Nothing changes until a person enters the approval key; then a draft pull request is opened, never merged.',
   history: 'Decisions your team recorded for this advisory (stored in FalkorDB and recalled on the next investigation), and which commit introduced the vulnerable version.',
 };

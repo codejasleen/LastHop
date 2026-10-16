@@ -9,6 +9,58 @@ import httpx
 from dotenv import load_dotenv
 
 
+class AgentLLMUnavailable(RuntimeError):
+    """No configured provider could take a tool-calling turn."""
+
+
+def _reset_seconds(response: httpx.Response) -> float:
+    """Groq reports when the per-minute token budget refills, e.g. '3.78s' or '1m2.5s'."""
+    raw = response.headers.get("retry-after") or response.headers.get("x-ratelimit-reset-tokens") or "5"
+    total, number = 0.0, ""
+    for ch in raw:
+        if ch.isdigit() or ch == ".":
+            number += ch
+        elif ch in "ms" and number:
+            total += float(number) * (60 if ch == "m" else 1)
+            number = ""
+    return total + (float(number) if number else 0.0)
+
+
+async def chat_with_tools(messages: list[dict], tools: list[dict]) -> tuple[dict, str, str]:
+    """One agent turn with OpenAI-style function calling. Returns (assistant message, provider, model).
+    Free tiers allow ~8k tokens/minute, so a 429 waits for the reset instead of failing the run."""
+    import asyncio
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    providers = [
+        ("groq", os.getenv("GROQ_API_KEY"), "https://api.groq.com/openai/v1/chat/completions",
+         os.getenv("GROQ_AGENT_MODEL", "openai/gpt-oss-120b")),
+        ("openrouter", os.getenv("OPENROUTER_API_KEY"), "https://openrouter.ai/api/v1/chat/completions",
+         os.getenv("OPENROUTER_MODEL", "openrouter/free")),
+    ]
+    errors = []
+    async with httpx.AsyncClient(timeout=60) as client:
+        for name, key, url, model in providers:
+            if not key:
+                continue
+            payload = {"model": model, "messages": messages, "tools": tools, "tool_choice": "auto", "temperature": 0.1}
+            if name == "groq":
+                payload.update(reasoning_effort="low", max_completion_tokens=1200)
+            for _ in range(4):
+                try:
+                    response = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
+                except httpx.HTTPError as exc:
+                    errors.append(f"{name}: {exc.__class__.__name__}")
+                    break
+                if response.status_code == 429:
+                    await asyncio.sleep(min(_reset_seconds(response) + 0.5, 30))
+                    continue
+                if response.is_success:
+                    return response.json()["choices"][0]["message"], name, model
+                errors.append(f"{name}: HTTP {response.status_code} {response.text[:160]}")
+                break
+    raise AgentLLMUnavailable("; ".join(errors) or "no LLM key configured")
+
+
 async def grounded_summary(question: str, facts: dict) -> tuple[str | None, str]:
     """Try configured providers in order, then let the caller use its rule-based text."""
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")

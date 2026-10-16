@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -372,6 +373,57 @@ class GraphStore:
         return {"cypher": self.CUT_POINTS_CYPHER, "db_ms": round(result.run_time_ms, 1), "rows": rows,
                 "shared_by_all": [row for row in rows if row["through"] == row["total"]]}
 
+    # ---- agent context: schema, read-only exploration, investigation memory ----------------
+
+    def schema_summary(self) -> dict[str, Any]:
+        """What is in the graph right now: the agent's map before it decides anything."""
+        labels = self.graph.ro_query("MATCH (n) RETURN labels(n)[0] AS label, count(*) AS n ORDER BY n DESC",
+                                     timeout=3000).result_set
+        rels = self.graph.ro_query("MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS n ORDER BY n DESC",
+                                   timeout=3000).result_set
+        repos = self.graph.ro_query("MATCH (r:Repo) RETURN DISTINCT split(r.id, '::')[0]", timeout=3000).result_set
+        return {"nodes": {row[0]: row[1] for row in labels}, "relationships": {row[0]: row[1] for row in rels},
+                "repos": sorted(row[0] for row in repos)}
+
+    WRITE_CLAUSE = re.compile(r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV|CALL\s+db\.)\b", re.I)
+
+    def read_query(self, cypher: str, limit: int = 50) -> dict[str, Any]:
+        """Agent-written Cypher, executed with GRAPH.RO_QUERY (the database itself refuses writes),
+        a 3 s timeout and a row cap. Write keywords are rejected before the query is sent."""
+        if self.WRITE_CLAUSE.search(cypher):
+            raise ValueError("Only read queries are allowed")
+        if not re.search(r"\bLIMIT\s+\d+\s*$", cypher.strip(), re.I):
+            cypher = f"{cypher.strip().rstrip(';')} LIMIT {limit}"
+        result = self.graph.ro_query(cypher, timeout=3000)
+        columns = [h[1] if isinstance(h, (list, tuple)) else h for h in result.header]
+        return {"cypher": cypher, "columns": columns, "db_ms": round(result.run_time_ms, 1),
+                "rows": [[_plain(value) for value in row] for row in result.result_set[:limit]]}
+
+    def save_investigation(self, root: str, advisory_id: str, record: dict[str, Any]) -> str:
+        """Memory across sessions. Investigation nodes carry no repo_id, so re-scanning a repo
+        (which replaces its snapshot) never erases what the agent concluded before."""
+        investigation_id = f"{root}:{advisory_id}:{record['created_at']}"
+        self.graph.query(
+            "CREATE (i:Investigation {id:$id, repo:$root, advisory:$advisory, question:$question, answer:$answer, "
+            "sha:$sha, created_at:$created_at, mode:$mode, tools:$tools, affected:$affected, reachable:$reachable})",
+            {"id": investigation_id, "root": root, "advisory": advisory_id, **record},
+        )
+        self.graph.query("MATCH (i:Investigation {id:$id}), (a:Advisory {id:$advisory}) MERGE (i)-[:ABOUT]->(a)",
+                         {"id": investigation_id, "advisory": advisory_id})
+        self.graph.query("MATCH (i:Investigation {id:$id}), (r:Repo) WHERE r.id = $root OR r.id STARTS WITH $prefix "
+                         "MERGE (i)-[:INVESTIGATED]->(r)", {"id": investigation_id, "root": root, "prefix": f"{root}::"})
+        return investigation_id
+
+    def recall_investigations(self, root: str, advisory_id: str | None = None) -> list[dict[str, Any]]:
+        rows = self.graph.ro_query(
+            "MATCH (i:Investigation {repo:$root}) WHERE $advisory IS NULL OR i.advisory = $advisory "
+            "RETURN i.created_at, i.advisory, i.question, i.answer, i.sha, i.affected, i.reachable, i.tools, i.mode "
+            "ORDER BY i.created_at DESC LIMIT 5",
+            {"root": root, "advisory": advisory_id}, timeout=3000,
+        ).result_set
+        keys = ["created_at", "advisory", "question", "answer", "sha", "affected", "reachable", "tools", "mode"]
+        return [dict(zip(keys, row)) for row in rows]
+
     def save_decision(self, repo: str, advisory_id: str, verdict: str, reason: str) -> None:
         repo_rows = self.graph.ro_query("MATCH (r:Repo {id:$repo}) RETURN r.sha LIMIT 1", {"repo": repo}, timeout=3000).result_set
         if not repo_rows:
@@ -434,6 +486,19 @@ class GraphStore:
                 "pull_request": {"number": int(pr_id.rsplit("#", 1)[-1]), "url": pr_url,
                                  "verification": verification} if pr_id else None,
                 "note": "Public author/reviewer names are not retained in FalkorDB."}
+
+
+def _plain(value: Any) -> Any:
+    """Turn FalkorDB nodes, edges and paths into JSON the agent can read."""
+    if hasattr(value, "nodes") and callable(value.nodes):
+        return {"path": [_plain(node) for node in value.nodes()]}
+    if hasattr(value, "labels"):
+        return {"labels": list(value.labels), **value.properties}
+    if hasattr(value, "relation"):
+        return {"type": value.relation, **value.properties}
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    return value
 
 
 def dependency_graph(snapshot: Snapshot) -> tuple[list, list[tuple[str, str]]]:

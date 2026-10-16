@@ -15,6 +15,11 @@ from .sources import normalize_repo
 from .llm import grounded_summary
 
 
+EXPOSURE_WORDS = {
+    "affected_exposed": "reachable from the internet", "declared_exposed": "reachable from the internet",
+    "affected_internal_declared": "internal only", "declared_internal": "internal only",
+    "affected_exposure_unknown": "unknown (no deployment evidence)", "declared_exposure_unknown": "unknown (no deployment evidence)",
+}
 ADVISORY_ID = re.compile(r"\b(?:CVE-\d{4}-\d{4,}|GHSA-[a-z0-9-]{10,})\b", re.I)
 
 
@@ -32,6 +37,9 @@ def plan(question: str, repo: str | None, advisory: str | None) -> list[tuple[st
         if any(word in question.lower() for word in ("rank", "priority", "blast", "impact", "bridge", "graph")):
             steps.append(("service_bridges", {"repo": repo}))
     steps.append(("advisory_fanout", {"advisory": advisory}))
+    # Runs after the scan has linked the advisory to its PackageVersion nodes, so it also
+    # finds other ingested repos that install the same vulnerable version.
+    steps.append(("graph_blast_radius", {"advisory": advisory}))
     return steps
 
 
@@ -103,6 +111,9 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
         summary = "No affected installed version was found in the scanned projects. Review coverage and unsupported manifests."
     else:
         summary = f"{fanout.get('count', 0)} affected ingested project(s) are linked to this advisory in FalkorDB."
+    others = [r for r in evidence.get("graph_blast_radius", {}).get("repos", []) if not repo or r != normalize_repo(repo)]
+    if others:
+        summary += f" Advisory-linked affected packages also appear in {len(others)} other repo(s) in the graph: {', '.join(others)}."
     origin = evidence.get("introducing_commit")
     if origin and origin.get("status") == "verified":
         summary += f" Git history traces the pin to commit {origin['commit'][:10]} by {origin.get('author') or 'an unknown author'}."
@@ -112,13 +123,19 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
                 for decision in project.get("decision_memory", {}).get("decisions", []))
     if stale:
         summary += f" {stale} earlier decision(s) need review after repository changes."
+    blast = evidence.get("graph_blast_radius", {})
+    scanned_root = normalize_repo(repo) if repo else None
     facts = {"advisory": steps[0][1]["advisory"], "affected_projects": len(affected),
              "fanout_projects": fanout.get("count", 0), "stale_decisions": stale,
+             "other_repos_with_advisory_linked_versions": [r for r in blast.get("repos", []) if r != scanned_root],
              "introducing_commit": origin,
-             "results": [{"repo": row["repo"], "verdict": row["verdict"], "priority": row.get("priority"),
-                          "paths": [p["path"] for p in row.get("vulnerable_paths", [])[:2]],
-                          "exposure": [service.get("exposure_path", []) for service in row.get("services", [])]}
-                         for row in results[:5]]}
+             # Only affected projects, with plain-word exposure: unaffected projects' exposure paths
+             # made the model claim they were "exposed".
+             "affected_results": [{"project": row["repo"].split("::")[-1].replace("#pip", ""),
+                                   "internet": EXPOSURE_WORDS.get(row["verdict"], "unknown"),
+                                   "shortest_path": min((p["path"] for p in row.get("vulnerable_paths", [])), key=len, default=[]),
+                                   "path_count": row.get("vulnerable_path_count", len(row.get("vulnerable_paths", [])))}
+                                  for row in affected[:8]]}
     written, provider = await grounded_summary(question, facts)
     return {"summary": written or summary, "summary_source": provider, "tool_trace": trace, "evidence": evidence,
             "limits": "Package and declared network paths only; function-level reachability and runtime traffic are not measured."}

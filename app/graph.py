@@ -326,6 +326,52 @@ class GraphStore:
         ).result_set
         return [{"service": name, "betweenness": score} for name, score in rows]
 
+    # Note: the repo is re-matched by id after the aggregation. On FalkorDB 6.0.2 a node carried
+    # through WITH after aggregating variable-length paths can stop matching later patterns.
+    # The whole blast radius as ONE graph query: every project in every ingested repo that
+    # installs an affected package version (shared PackageVersion node), how many dependency
+    # paths reach it, the internet-exposure hop count, and any past decision on it.
+    BLAST_RADIUS_CYPHER = (
+        "MATCH (a:Advisory {id:$id})-[:AFFECTS_VERSION]->(pv:PackageVersion)<-[:INSTANCE_OF]-(d:Dependency)\n"
+        "MATCH dep=(r:Repo)-[:DEPENDS_ON*1..12]->(d)\n"
+        "WITH r.id AS rid, pv, count(dep) AS paths, min(length(dep)) AS hops\n"
+        "MATCH (r:Repo {id:rid})\n"
+        "OPTIONAL MATCH (r)-[:RUNS]->(s:Service)\n"
+        "OPTIONAL MATCH e=(:Internet)-[:REACHES]->(:Exposure)-[:ROUTES_TO]->(:Service)-[:CALLS*0..8]->(s)\n"
+        "WITH r, pv, paths, hops, s, min(length(e)) AS internet_hops\n"
+        "OPTIONAL MATCH (r)-[:HAS_DECISION]->(dec:Decision {advisory_id:$id})\n"
+        "RETURN split(r.id, '::')[0] AS repo, r.id AS project, pv.name + '@' + pv.version AS package,\n"
+        "       paths, hops, s.name AS service, internet_hops, collect(DISTINCT dec.verdict) AS decisions\n"
+        "ORDER BY internet_hops, repo, project LIMIT 100"
+    )
+
+    def blast_radius(self, advisory_id: str) -> dict[str, Any]:
+        result = self.graph.ro_query(self.BLAST_RADIUS_CYPHER, {"id": advisory_id}, timeout=5000)
+        cols = ["repo", "project", "package", "paths", "hops", "service", "internet_hops", "decisions"]
+        rows = [dict(zip(cols, row)) for row in result.result_set]
+        return {"advisory": advisory_id, "cypher": self.BLAST_RADIUS_CYPHER, "db_ms": round(result.run_time_ms, 1),
+                "rows": rows, "repos": sorted({row["repo"] for row in rows})}
+
+    # Which packages do ALL vulnerable paths share? Those are the cut points: one change there
+    # touches every path. Computed by counting, per intermediate node, the paths that cross it.
+    CUT_POINTS_CYPHER = (
+        "MATCH p=(r:Repo {id:$repo})-[:DEPENDS_ON*1..12]->(t:Dependency {id:$target})\n"
+        "WITH collect(p) AS paths\n"
+        "WITH paths, size(paths) AS total\n"
+        "UNWIND range(0, total - 1) AS k\n"
+        "WITH total, k, nodes(paths[k]) AS ns\n"
+        "UNWIND range(1, size(ns) - 2) AS i\n"
+        "WITH total, k, i, ns[i] AS n\n"
+        "RETURN n.name AS package, n.version AS version, count(DISTINCT k) AS through, total, min(i) AS depth\n"
+        "ORDER BY through DESC, depth ASC LIMIT 6"
+    )
+
+    def cut_points(self, repo: str, dependency_id: str) -> dict[str, Any]:
+        result = self.graph.ro_query(self.CUT_POINTS_CYPHER, {"repo": repo, "target": dependency_id}, timeout=5000)
+        rows = [dict(zip(["package", "version", "through", "total", "depth"], row)) for row in result.result_set]
+        return {"cypher": self.CUT_POINTS_CYPHER, "db_ms": round(result.run_time_ms, 1), "rows": rows,
+                "shared_by_all": [row for row in rows if row["through"] == row["total"]]}
+
     def save_decision(self, repo: str, advisory_id: str, verdict: str, reason: str) -> None:
         repo_rows = self.graph.ro_query("MATCH (r:Repo {id:$repo}) RETURN r.sha LIMIT 1", {"repo": repo}, timeout=3000).result_set
         if not repo_rows:

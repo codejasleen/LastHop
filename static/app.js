@@ -5,6 +5,7 @@ const VERDICT = {
   affected_exposed: {cls: 'bad', label: 'Affected · reachable from internet'},
   declared_exposed: {cls: 'bad', label: 'Python pin · reachable from internet'},
   affected_internal_declared: {cls: 'warn', label: 'Affected · internal only'},
+  declared_internal: {cls: 'warn', label: 'Python pin · internal only'},
   affected_exposure_unknown: {cls: 'warn', label: 'Affected · exposure unknown'},
   declared_exposure_unknown: {cls: 'warn', label: 'Python pin · exposure unknown'},
   insufficient_evidence: {cls: 'warn', label: 'Insufficient evidence'},
@@ -17,6 +18,7 @@ const RANK = {bad: 0, warn: 1, good: 2, skip: 3};
 const TOOL_DESC = {
   scan_public_repo: 'Fetched the latest commit, loaded lockfiles and manifests into FalkorDB, matched the advisory ranges',
   exposure_evidence: 'Walked Internet → ingress → service calls from the Kubernetes manifests',
+  graph_blast_radius: 'One Cypher query across every ingested repo: shared package version → dependency paths → internet exposure → past decisions',
   service_bridges: 'Ran algo.betweenness over the service call graph',
   advisory_fanout: 'Counted every project the advisory reaches across the graph',
 };
@@ -228,12 +230,38 @@ function renderVerdict(entry, scan) {
   if (unknown) lines.push(`${unknown} with no deployment evidence (exposure unknown)`);
   if (affected.length) lines.push(fixes ? `Fix candidate for ${fixes} project${fixes === 1 ? '' : 's'}, verified in Files changed` : 'No automatic fix: manual review');
   if (skipped) lines.push(`${skipped} project${skipped === 1 ? '' : 's'} in another ecosystem skipped`);
+  const others = otherRepoRows(entry);
+  if (others.length) lines.push(`Advisory-linked affected packages also appear in ${[...new Set(others.map(o => o.repo))].join(', ')} (graph)`);
   const source = entry.data.summary_source === 'deterministic' ? 'rule-based summary' : esc(entry.data.summary_source || 'agent');
   $('r-verdict').className = `verdict ${cls}`;
   $('r-verdict').innerHTML = `<div class="verdict-icon">${icon}</div><div>
     <h2>${esc(title)}</h2><p>${esc(lines.join(' · '))}</p>
     ${entry.data.summary ? `<div class="agent-says"><span class="who">Agent · ${source}</span><br>${esc(entry.data.summary)}</div>` : ''}
   </div>`;
+}
+
+// ---------- graph-only insights ----------
+function otherRepoRows(entry) {
+  const scanned = entry.data.evidence.scan_public_repo.source?.repo || entry.repo;
+  return (entry.data.evidence.graph_blast_radius?.rows || []).filter(row => row.repo !== scanned);
+}
+
+function cutHtml(r) {
+  const cp = r.cut_points;
+  if (!cp || !cp.rows?.length) return '';
+  const all = cp.shared_by_all || [];
+  const total = cp.rows[0].total;
+  const query = `<details class="raw"><summary>Cypher · ${esc(cp.db_ms)} ms in FalkorDB</summary><pre>${esc(cp.cypher)}</pre></details>`;
+  if (!all.length) {
+    const top = cp.rows[0];
+    return `<div class="callout"><b>No single cut point:</b> the ${total} paths split early. The most shared package is ${esc(top.package)} (${top.through} of ${total} paths).${query}</div>`;
+  }
+  const first = all[0];
+  const chain = all.map(p => `<code>${esc(p.package)}</code>`).join(' → ');
+  const lead = first.depth === 1
+    ? `${esc(first.package)} is a <b>direct dependency</b> of this project, so it is the one place you control that every path crosses.`
+    : `Every path crosses ${all.length === 1 ? 'this package' : 'these packages'}; a fix there reaches all ${total} paths.`;
+  return `<div class="callout accent-callout"><b>Where to cut:</b> all ${total} of ${total} dependency paths pass through ${chain}. ${lead}${query}</div>`;
 }
 
 // ---------- overview: checks list ----------
@@ -297,8 +325,11 @@ function checkHtml(r, scan, idx) {
         <div><div class="detail-title">Dependency path · shortest of ${total}</div>${treeHtml(vp.path, r, vp)}
           ${paths.length > 1 ? `<details class="raw more-paths"><summary>${total - 1} more path${total === 2 ? '' : 's'}${total > paths.length ? ` (next ${paths.length - 1} shown)` : ''}</summary>${paths.slice(1).map(p => treeHtml(p.path, r, p)).join('<br>')}</details>` : ''}</div>
         <div><div class="detail-title">Exposure path · from deployment manifests</div>
-          ${svcWithPath ? stepsHtml(svcWithPath) : '<div class="callout attention">No deployment evidence for this project, so exposure is unknown. BlastRadius does not guess.</div>'}</div>
+          ${svcWithPath ? stepsHtml(svcWithPath)
+            : (r.services || []).length ? `<div class="callout success"><b>Internal only:</b> the manifests declare ${(r.services || []).map(s => `<code>${esc(s.name)}</code>`).join(', ')}, and the graph finds no path from the internet to ${(r.services || []).length === 1 ? 'it' : 'them'} (no public route, no caller chain).</div>`
+            : '<div class="callout attention">No deployment evidence for this project, so exposure is unknown. BlastRadius does not guess.</div>'}</div>
       </div>
+      ${cutHtml(r)}
       ${moduleHtml(r)}
       <dl class="facts">
         <dt>Owner</dt><dd>${esc(r.owner || 'unknown (no CODEOWNERS)')}</dd>
@@ -385,6 +416,20 @@ function graphElements(entry) {
     });
     edge(prev, adv, 'affects');
   });
+  // Other repos that install the same vulnerable version: extra lanes joining the shared package node.
+  const extraPkgs = [];
+  const otherProjects = [...new Map(otherRepoRows(entry).map(row => [`${row.project}|${row.package}`, row])).values()];
+  otherProjects.forEach((row, k) => {
+    const lane = affected.length + k;
+    const id = `other:${row.project}`;
+    const owner = row.repo.split('/')[0];
+    node(id, `${projectName(row.project)} · ${owner} (${row.paths} path${row.paths === 1 ? '' : 's'})`, 'other', lane, Math.max(maxDepth - 1, 0));
+    const pkg = `pkg:${row.package}`;
+    if (!nodes.has(pkg)) { node(pkg, row.package.replace(/@(?=[^@]*$)/, ' '), 'vuln', lane, maxDepth); extraPkgs.push(pkg); }
+    lanesOf.get(pkg).add(lane);
+    edge(id, pkg, 'other');
+  });
+  extraPkgs.forEach(pkg => edge(pkg, adv, 'affects'));
   node(adv, scan.advisory.id, 'advisory', 0, maxDepth + 1);
   lanesOf.set(adv, new Set(affected.map((_, i) => i)));
   // The shared vulnerable package sits at the deepest row any lane reaches it.
@@ -414,13 +459,36 @@ function drawGraph() {
       {selector: 'edge', style: {width: 1.5, 'line-color': '#484f58', 'target-arrow-color': '#484f58', 'target-arrow-shape': 'triangle', 'curve-style': 'straight', 'arrow-scale': .7}},
       {selector: 'edge[kind="exposure"]', style: {'line-color': '#f78166', 'target-arrow-color': '#f78166', 'line-style': 'dashed', width: 2}},
       {selector: 'edge[kind="affects"]', style: {'line-color': '#f85149', 'target-arrow-color': '#f85149', width: 2}},
+      {selector: 'node[kind="other"]', style: {'background-color': '#388bfd', shape: 'barrel', width: 18, height: 16, color: '#79c0ff', 'font-weight': 600}},
+      {selector: 'edge[kind="other"]', style: {'line-color': '#388bfd', 'target-arrow-color': '#388bfd', 'line-style': 'dotted', width: 2}},
     ],
     layout: {name: 'preset', padding: 30},
   });
   cy.fit(undefined, 30);
+  renderGraphQuery(current);
   const bridges = (current.data.evidence.service_bridges?.services || []).filter(s => s.betweenness > 0).slice(0, 4);
   $('graph-note').textContent = `Shortest dependency path per affected project, joined to its exposure path from the Kubernetes manifests. `
     + (bridges.length ? `Service size = betweenness (algo.betweenness): ${bridges.map(s => `${s.service} ${s.betweenness}`).join(', ')}.` : '');
+}
+
+function renderGraphQuery(entry) {
+  const b = entry.data.evidence.graph_blast_radius;
+  if (!b) { $('graph-query').innerHTML = ''; return; }
+  const scanned = entry.data.evidence.scan_public_repo.source?.repo || entry.repo;
+  const projectCount = new Set(b.rows.map(row => row.project)).size;
+  const exposure = (row) => row.internet_hops != null ? `<span class="s-bad">reachable · ${row.internet_hops} hops</span>`
+    : row.service ? '<span class="muted">internal</span>' : '<span class="muted">unknown</span>';
+  $('graph-query').innerHTML = `<div class="box" style="margin-top:16px">
+    <div class="box-header"><span>One graph query · the whole blast radius</span>
+      <span class="muted small">${projectCount} project${projectCount === 1 ? '' : 's'} · ${b.repos.length} repo${b.repos.length === 1 ? '' : 's'} · ${esc(b.db_ms)} ms in FalkorDB ·
+      <a href="http://127.0.0.1:3000" target="_blank" rel="noopener noreferrer">Open FalkorDB Browser</a></span></div>
+    <pre class="cypher">${esc(b.cypher)}</pre>
+    <table class="qtable"><thead><tr><th>Repo / project</th><th>Package</th><th>Paths</th><th>Shortest</th><th>Service</th><th>Internet</th><th>Decisions</th></tr></thead><tbody>
+    ${b.rows.map(row => `<tr class="${row.repo !== scanned ? 'other' : ''}">
+      <td>${row.repo !== scanned ? '<span class="label accent">other repo</span> ' : ''}<b>${esc(row.repo)}</b><div class="muted small">${esc(projectName(row.project))}</div></td>
+      <td><code>${esc(row.package)}</code></td><td>${esc(row.paths)}</td><td>${esc(row.hops)} hop${row.hops === 1 ? '' : 's'}</td>
+      <td>${esc(row.service || '–')}</td><td>${exposure(row)}</td><td>${esc((row.decisions || []).join(', ') || '–')}</td></tr>`).join('')}
+    </tbody></table></div>`;
 }
 
 // ---------- agent run ----------

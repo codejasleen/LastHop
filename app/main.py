@@ -176,7 +176,12 @@ def _verdict(paths: list[dict], checked: list[dict], context: dict, uncertain: b
         if paths:
             if any(s["exposure"] == "public" and s["public_route"] for s in context["services"]):
                 return "declared_exposed", "A pinned Python requirement is affected, and a declared public path reaches this service. Installation and function-level use are unverified."
+            if context["services"] and all(s["exposure"] == "internal" for s in context["services"]):
+                return "declared_internal", "A pinned Python requirement is affected; the deployment manifests declare this service internal only."
             return "declared_exposure_unknown", "A pinned Python requirement is affected; deployment exposure or actual installation is not established."
+        if checked and not uncertain:
+            # An exact `==` pin is what pip installs, so a pin outside every affected range is positive evidence.
+            return "not_affected_version", "The package is pinned with ==, and the pinned version is outside the advisory's affected ranges."
         return "insufficient_evidence", "No affected Python pin was observed. requirements.txt does not prove transitive dependency completeness, so absence is inconclusive."
     if paths:
         services = context["services"]
@@ -217,6 +222,15 @@ def investigate_one(graph: GraphStore, repo: str, advisory: Advisory) -> dict:
                 vulnerable_paths.append(path_info)
                 if package.first_patched and context.get("manager") != "pip":
                     fix_candidates.append({"package": package.name, "first_patched": package.first_patched, "direct": len(path["nodes"]) == 2})
+                elif package.first_patched and not any(c["package"] == package.name for c in fix_candidates):
+                    # The advisory does name a fix; pip-compile files carry hashes, so the pin must be
+                    # regenerated rather than hand-edited. Report it as a manual step, never as "no fix".
+                    fix_candidates.append({
+                        "package": package.name, "first_patched": package.first_patched, "before": path["version"],
+                        "direct": len(path["nodes"]) == 2, "strategy": "manual_review",
+                        "reason": f"regenerate the pinned requirements, e.g. pip-compile --upgrade-package "
+                                  f"{package.name}=={package.first_patched}",
+                    })
             elif match is None:
                 uncertain = True
     verdict, explanation = (_verdict(vulnerable_paths, checked_paths, context, uncertain) if eligible else
@@ -241,6 +255,11 @@ async def enrich_live_result(graph: GraphStore, snapshot, advisory: Advisory, re
     """Attach bounded source evidence and a checked fix plan to a live result."""
     result["module_evidence"] = []
     result["priority"] = "Review"
+    if result["vulnerable_paths"]:
+        try:
+            result["cut_points"] = graph.cut_points(snapshot.repo, result["vulnerable_paths"][0]["dependency_id"])
+        except Exception:  # a timeout here must not cost the verdict itself
+            result["cut_points"] = None
     if snapshot.manager != "npm" or not result["vulnerable_paths"]:
         return
     dependencies, edges = dependency_graph(snapshot)
@@ -286,7 +305,7 @@ async def investigate(request: InvestigationRequest) -> dict:
         if not selected:
             raise HTTPException(404, "No matching repository has been ingested")
         results = [investigate_one(graph, repo, advisory) for repo in selected]
-        order = {"affected_exposed": 0, "declared_exposed": 1, "affected_exposure_unknown": 2, "declared_exposure_unknown": 3, "affected_internal_declared": 4, "insufficient_evidence": 5, "not_affected_version": 6, "not_present": 7, "not_applicable": 8}
+        order = {"affected_exposed": 0, "declared_exposed": 1, "affected_exposure_unknown": 2, "declared_exposure_unknown": 3, "affected_internal_declared": 4, "declared_internal": 4, "insufficient_evidence": 5, "not_affected_version": 6, "not_present": 7, "not_applicable": 8}
         results.sort(key=lambda row: (order[row["verdict"]], row["repo"]))
         return {
             "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url},
@@ -321,7 +340,7 @@ async def scan_live(request: LiveScanRequest) -> dict:
             await enrich_live_result(graph, snapshot, advisory, result)
             result["priority"], result["priority_reasons"] = assign_priority(result, signals)
             results.append(result)
-        order = {"affected_exposed": 0, "declared_exposed": 1, "affected_exposure_unknown": 2, "declared_exposure_unknown": 3, "affected_internal_declared": 4, "insufficient_evidence": 5, "not_affected_version": 6, "not_present": 7, "not_applicable": 8}
+        order = {"affected_exposed": 0, "declared_exposed": 1, "affected_exposure_unknown": 2, "declared_exposure_unknown": 3, "affected_internal_declared": 4, "declared_internal": 4, "insufficient_evidence": 5, "not_affected_version": 6, "not_present": 7, "not_applicable": 8}
         results.sort(key=lambda row: (order[row["verdict"]], row["repo"]))
         return {
             "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url},
@@ -347,6 +366,17 @@ async def scan_live(request: LiveScanRequest) -> dict:
         raise HTTPException(502, "GitHub is unreachable; try again shortly") from exc
     except Exception as exc:
         raise HTTPException(502, f"Live scan failed: {exc.__class__.__name__}") from exc
+
+
+@app.get("/api/graph/blast-radius/{advisory_id}")
+def graph_blast_radius(advisory_id: str) -> dict:
+    """The cross-repo blast radius as one FalkorDB query (query text and timing included)."""
+    try:
+        return store().blast_radius(advisory_id.upper())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Graph query failed: {exc.__class__.__name__}: {exc}") from exc
 
 
 @app.post("/api/decisions")

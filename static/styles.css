@@ -93,6 +93,12 @@ input::placeholder, textarea::placeholder { color: var(--subtle); }
 .label.attention { color: #e3b341; background: var(--attention-bg); border-color: var(--attention-border); }
 .label.success { color: #56d364; background: var(--success-bg); border-color: var(--success-border); }
 .label.accent { color: #79c0ff; background: #388bfd26; border-color: #388bfd66; }
+.callout.accent-callout { border-color: #388bfd66; background: #388bfd1a; }
+.cypher { margin: 0; padding: 12px 16px; background: var(--bg-inset); border-bottom: 1px solid var(--border); font: 12px/1.6 var(--mono); color: #d2a8ff; overflow: auto; white-space: pre; }
+.qtable { width: 100%; border-collapse: collapse; font-size: 13px; }
+.qtable th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; padding: 8px 16px; border-bottom: 1px solid var(--border); }
+.qtable td { padding: 8px 16px; border-bottom: 1px solid var(--border-muted); vertical-align: top; }
+.qtable tr.other td { background: #388bfd0d; }
 .coverage { flex-basis: 100%; font-size: 12px; color: var(--muted); margin-top: 4px; }
 .coverage b { color: #e3b341; font-weight: 600; }
 .label.done { color: #d2a8ff; background: #ab7df826; border-color: #ab7df866; }

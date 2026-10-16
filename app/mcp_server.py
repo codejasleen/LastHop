@@ -31,6 +31,13 @@ def advisory_fanout(advisory: str) -> dict:
 
 
 @mcp.tool()
+def graph_blast_radius(advisory: str) -> dict:
+    """One FalkorDB query: every project in every ingested repo that installs an affected
+    package version, its dependency-path count, internet-exposure hops and past decisions."""
+    return GraphStore().blast_radius(advisory.upper())
+
+
+@mcp.tool()
 def decision_memory(repo: str, advisory: str) -> dict:
     """Read prior human decisions and flag ones recorded against a different repository commit."""
     context = GraphStore().context(repo, advisory.upper())

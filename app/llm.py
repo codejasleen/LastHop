@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import httpx
+from dotenv import load_dotenv
 
 
 async def grounded_summary(question: str, facts: dict) -> tuple[str | None, str]:
     """Try configured providers in order, then let the caller use its rule-based text."""
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     instruction = (
         "Write one or two plain sentences answering the question using only the JSON facts. "
         "Do not introduce a CVE, repo, path, risk rating, exploit claim, owner, or action absent from the facts. "
@@ -38,10 +41,14 @@ async def grounded_summary(question: str, facts: dict) -> tuple[str | None, str]
                     response.raise_for_status()
                     value = response.json()["candidates"][0]["content"]["parts"][0]["text"]
                 else:
-                    response = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json={
+                    payload = {
                         "model": model, "max_tokens": 150, "temperature": 0.1,
                         "messages": [{"role": "system", "content": instruction}, {"role": "user", "content": user}],
-                    })
+                    }
+                    if name == "groq":
+                        payload.pop("max_tokens")
+                        payload.update(max_completion_tokens=512, reasoning_effort="low")
+                    response = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
                     response.raise_for_status()
                     value = response.json()["choices"][0]["message"]["content"]
                 if isinstance(value, str) and 10 <= len(value.strip()) <= 700:

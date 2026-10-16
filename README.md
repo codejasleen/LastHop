@@ -19,6 +19,8 @@ python -m venv .venv
 
 Open <http://127.0.0.1:8000>. The FalkorDB Browser is at <http://127.0.0.1:3000>. **Try real example** scans Online Boutique. A public repo needs no sign-in. `GITHUB_TOKEN` is optional for higher API limits and required, with write permission to the target repo, for draft PR creation. When anonymous API quota is exhausted, source ingestion falls back to a bounded GitHub archive.
 
+For optional Groq summaries, set `GROQ_API_KEY` in a local `.env` file (see `.env.example`). The app reads it when an agent summary runs, and Git ignores the file.
+
 `docker compose up --build` runs both the database and app in containers. The app image includes Git for the provenance fallback.
 
 Launch the MCP server separately for an external MCP client:

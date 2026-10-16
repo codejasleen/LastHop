@@ -3,66 +3,120 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#1c1d1c">
-  <title>BlastRadius · Investigations</title>
-  <link rel="stylesheet" href="/static/styles.css">
-  <link rel="stylesheet" href="/static/fix.css">
+  <meta name="theme-color" content="#0d1117">
+  <title>BlastRadius</title>
+  <link rel="stylesheet" href="/static/styles.css?v=2">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js" defer></script>
 </head>
 <body>
-  <div class="shell">
-    <aside class="rail" aria-label="Workspace navigation">
-      <a class="brand" href="#top" aria-label="BlastRadius home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>BlastRadius</span></a>
-      <div class="rail-section">Workspace</div>
-      <a class="nav-item active" href="#investigate"><span class="nav-icon" aria-hidden="true">⌕</span> Investigations</a>
-      <a class="nav-item" href="#repos"><span class="nav-icon" aria-hidden="true">▦</span> Repositories</a>
-      <div class="rail-spacer"></div>
-      <div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Checking FalkorDB…</span></div>
-      <p class="rail-note">Evidence is read from the graph at investigation time.</p>
+  <header class="appbar">
+    <a class="brand" href="#" id="home-link" aria-label="BlastRadius home"><span class="brand-mark" aria-hidden="true">◎</span> BlastRadius</a>
+    <nav class="crumbs" id="crumbs" aria-label="Breadcrumb"><span>Investigations</span></nav>
+    <div class="appbar-right">
+      <span class="conn" id="conn"><span class="dot"></span><span id="conn-label">Checking FalkorDB…</span></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar" aria-label="Investigations">
+      <button class="btn btn-primary btn-block" id="new-investigation" type="button">＋ New investigation</button>
+      <div class="side-title">Recent investigations</div>
+      <ul class="side-list" id="history"><li class="side-empty">None yet</li></ul>
+      <div class="side-title">Repositories in graph <span class="counter" id="repo-count">0</span></div>
+      <ul class="side-list" id="repos"><li class="side-empty">None yet</li></ul>
     </aside>
 
-    <main id="top">
-      <header class="topbar">
-        <div><div class="eyebrow">Security workspace</div><h1>Investigations</h1><p>Check a CVE against the latest commit of a public GitHub repository.</p></div>
-        <span class="top-tag">Public GitHub repos · npm / pnpm / Yarn / pinned Python</span>
-      </header>
-
-      <section class="workspace-grid" aria-label="Start an investigation">
-        <div id="investigate" class="panel investigation-panel">
-          <div class="panel-heading"><div><div class="panel-kicker">MCP investigation agent</div><h2>Trace a vulnerability</h2></div><span class="panel-icon" aria-hidden="true">↗</span></div>
-          <p class="muted">Paste a public repo URL and a CVE. The agent refreshes its lockfiles and deployment evidence, then follows graph paths across projects and services.</p>
-          <form id="investigation-form" class="form-stack">
-            <label for="live-repo">Public GitHub repository</label>
-            <input id="live-repo" placeholder="https://github.com/owner/repo or owner/repo" required spellcheck="false" autocomplete="off">
-            <label for="advisory" class="stacked-label">CVE or GitHub advisory ID</label>
-            <div class="input-row"><input id="advisory" placeholder="CVE-2024-… or GHSA-…" required spellcheck="false" autocomplete="off"><button class="primary" type="submit">Scan latest <span aria-hidden="true">→</span></button></div>
-            <label for="agent-question" class="stacked-label">Ask the agent (optional)</label>
-            <input id="agent-question" placeholder="Which services can be reached, and what did we decide last time?" maxlength="500" spellcheck="false" autocomplete="off">
-            <p class="form-hint">Finds npm, pnpm v9, Yarn Classic, and pinned Python requirements in nested projects. No GitHub sign-in needed.</p>
-          </form>
+    <main class="main" id="main">
+      <!-- New investigation -->
+      <section id="view-new" class="view">
+        <div class="blankslate">
+          <h1>Trace a vulnerability through a real codebase</h1>
+          <p>Give the agent a public GitHub repo and a CVE. It reads the latest commit's lockfiles and Kubernetes manifests into FalkorDB, then shows which services the vulnerable package reaches, whether the internet can reach them, who owns them, and the fix.</p>
         </div>
+        <form id="form" class="box form-box">
+          <div class="box-row">
+            <label for="f-repo">Repository</label>
+            <input id="f-repo" placeholder="owner/repo or https://github.com/owner/repo" required spellcheck="false" autocomplete="off">
+          </div>
+          <div class="box-row">
+            <label for="f-adv">Advisory</label>
+            <input id="f-adv" placeholder="CVE-2026-… or GHSA-…" required spellcheck="false" autocomplete="off">
+          </div>
+          <div class="box-row">
+            <label for="f-q">Ask the agent <span class="optional">optional</span></label>
+            <input id="f-q" placeholder="What is the blast radius, and what did we decide last time?" maxlength="500" spellcheck="false" autocomplete="off">
+          </div>
+          <div class="box-foot">
+            <span class="hint">npm, pnpm v9, Yarn Classic and pinned Python · no sign-in needed</span>
+            <span class="foot-actions">
+              <button class="btn" id="example" type="button">Try Online Boutique</button>
+              <button class="btn btn-primary" id="submit" type="submit">Start investigation</button>
+            </span>
+          </div>
+        </form>
+        <ul class="checks-legend">
+          <li><b>Checks</b></li><li>✓ Dependency paths in FalkorDB</li><li>✓ Exposure from deployment manifests</li><li>✓ Owners and past decisions</li><li class="dim">Function-level reachability is not measured</li>
+        </ul>
+      </section>
 
-        <div id="repos" class="panel repo-panel">
-          <div class="panel-heading"><div><div class="panel-kicker">Data sources</div><h2>Repositories</h2></div><span id="repo-count" class="count">0 repos</span></div>
-          <p class="muted">Repos you scan appear here. Start with a real multi-service example from Google’s Online Boutique.</p>
-          <div id="repo-list" class="repo-list"><div class="empty-small">No repositories imported yet.</div></div>
-          <div class="actions"><button id="real-example" class="secondary" type="button">Try real example</button></div>
+      <!-- Running -->
+      <section id="view-running" class="view hidden">
+        <div class="box running">
+          <div class="spinner" aria-hidden="true"></div>
+          <div>
+            <div class="running-title" id="running-title">Investigating…</div>
+            <div class="muted">The agent is fetching the latest commit, loading lockfiles and manifests into FalkorDB, and walking the paths. Large repos take up to a minute.</div>
+          </div>
         </div>
       </section>
 
-      <div class="scope-note"><strong>What this checks</strong><span>Package path in FalkorDB</span><span>Declared service exposure</span><span>Owner and prior decisions</span><small>Function-level code reachability is not measured.</small></div>
+      <!-- Investigation -->
+      <section id="view-result" class="view hidden">
+        <div class="issue-head">
+          <div class="issue-title-row">
+            <h1 class="issue-title"><span id="r-title"></span> <a id="r-adv-link" class="issue-number" target="_blank" rel="noopener noreferrer"></a></h1>
+          </div>
+          <div class="issue-meta" id="r-meta"></div>
+          <div class="labels" id="r-labels"></div>
+        </div>
 
-      <section id="results-section" class="results-section hidden" aria-live="polite"><div class="results-header"><div><div class="panel-kicker">Investigation results</div><h2 id="results-title">Advisory impact</h2><p id="results-source" class="results-source"></p><p id="results-scope" class="results-scope hidden"></p><p id="results-summary"></p><p id="agent-summary" class="results-source"></p><p id="agent-trace" class="results-source"></p><p id="graph-summary" class="results-source"></p></div><span id="results-severity" class="severity"></span></div><div id="results" class="results"></div></section>
-      <div id="notice" class="notice hidden" role="status"></div>
+        <div class="verdict" id="r-verdict"></div>
 
-      <div id="fix-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="fix-title">
-        <div class="modal"><div class="modal-top"><div><div class="panel-kicker">Review before creating a pull request</div><h2 id="fix-title">Review proposed fix</h2></div><button id="close-modal" class="ghost" type="button">Close</button></div><p id="fix-description" class="muted"></p><pre id="fix-diff" class="diff"></pre><label for="admin-key">Approval key</label><div class="input-row"><input id="admin-key" type="password" placeholder="BLASTRADIUS_ADMIN_KEY" autocomplete="off"><button id="approve-fix" class="primary" type="button">Create draft PR</button></div><p class="form-hint">The server also needs a GitHub token with Contents and Pull requests write access. This creates a branch and draft PR; it does not merge.</p></div>
-      </div>
-      <div id="decision-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="decision-title">
-        <form id="decision-form" class="modal decision-modal"><div class="modal-top"><div><div class="panel-kicker">Investigation history</div><h2 id="decision-title">Record a decision</h2></div><button id="close-decision" class="ghost" type="button">Close</button></div><p id="decision-description" class="muted"></p><label for="decision-verdict">Decision</label><select id="decision-verdict"><option value="investigate">Investigate further</option><option value="accepted_risk">Accept risk</option><option value="remediated">Remediated</option></select><label for="decision-reason">Reason and evidence</label><textarea id="decision-reason" required minlength="4" maxlength="500" placeholder="Why did the team make this decision?"></textarea><button class="primary" type="submit">Save decision</button></form>
-      </div>
-      <footer>BlastRadius <span>·</span> Every result links back to its evidence.</footer>
+        <nav class="tabs" id="tabs" role="tablist">
+          <button class="tab active" data-tab="overview" role="tab">Overview <span class="counter" id="c-overview"></span></button>
+          <button class="tab" data-tab="graph" role="tab">Blast radius</button>
+          <button class="tab" data-tab="agent" role="tab">Agent run <span class="counter" id="c-agent"></span></button>
+          <button class="tab" data-tab="files" role="tab">Files changed <span class="counter" id="c-files"></span></button>
+          <button class="tab" data-tab="history" role="tab">History</button>
+        </nav>
+
+        <div class="tab-panel" id="tab-overview"></div>
+        <div class="tab-panel hidden" id="tab-graph">
+          <div class="box">
+            <div class="box-header"><span>Internet → services → packages → advisory</span><span class="legend"><i class="lg-net"></i>entry <i class="lg-svc"></i>service <i class="lg-pkg"></i>package <i class="lg-bad"></i>vulnerable</span></div>
+            <div id="cy" class="cy"></div>
+          </div>
+          <p class="muted small" id="graph-note"></p>
+        </div>
+        <div class="tab-panel hidden" id="tab-agent"></div>
+        <div class="tab-panel hidden" id="tab-files"></div>
+        <div class="tab-panel hidden" id="tab-history"></div>
+      </section>
     </main>
   </div>
-  <script src="/static/app.js"></script>
+
+  <div id="decision-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="decision-title">
+    <form id="decision-form" class="modal">
+      <div class="modal-head"><h2 id="decision-title">Record a decision</h2><button class="btn-icon" id="close-decision" type="button" aria-label="Close">✕</button></div>
+      <p class="muted" id="decision-desc"></p>
+      <label for="decision-verdict">Decision</label>
+      <select id="decision-verdict"><option value="investigate">Investigate further</option><option value="accepted_risk">Accept risk</option><option value="remediated">Remediated</option></select>
+      <label for="decision-reason">Reason and evidence</label>
+      <textarea id="decision-reason" required minlength="4" maxlength="500" placeholder="Why did the team make this decision?"></textarea>
+      <div class="modal-foot"><button class="btn btn-primary" type="submit">Save to graph</button></div>
+    </form>
+  </div>
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/static/app.js?v=2"></script>
 </body>
 </html>

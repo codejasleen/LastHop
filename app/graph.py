@@ -392,12 +392,17 @@ class GraphStore:
         a 3 s timeout and a row cap. Write keywords are rejected before the query is sent."""
         if self.WRITE_CLAUSE.search(cypher):
             raise ValueError("Only read queries are allowed")
-        if not re.search(r"\bLIMIT\s+\d+\s*$", cypher.strip(), re.I):
-            cypher = f"{cypher.strip().rstrip(';')} LIMIT {limit}"
+        row_limit = min(max(limit, 1), 50)
+        cypher = cypher.strip().rstrip(";").strip()
+        trailing_limit = re.search(r"\bLIMIT\s+(\d+)\s*$", cypher, re.I)
+        if trailing_limit:
+            cypher = cypher[:trailing_limit.start()] + f"LIMIT {min(int(trailing_limit.group(1)), row_limit)}"
+        else:
+            cypher = f"{cypher} LIMIT {row_limit}"
         result = self.graph.ro_query(cypher, timeout=3000)
         columns = [h[1] if isinstance(h, (list, tuple)) else h for h in result.header]
         return {"cypher": cypher, "columns": columns, "db_ms": round(result.run_time_ms, 1),
-                "rows": [[_plain(value) for value in row] for row in result.result_set[:limit]]}
+                "rows": [[_plain(value) for value in row] for row in result.result_set[:row_limit]]}
 
     def save_investigation(self, root: str, advisory_id: str, record: dict[str, Any]) -> str:
         """Memory across sessions. Investigation nodes carry no repo_id, so re-scanning a repo

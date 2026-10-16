@@ -17,7 +17,8 @@ from .graph import GraphStore
 from .sources import normalize_repo
 from .llm import AgentLLMUnavailable, chat_with_tools, grounded_summary
 
-MAX_STEPS = 8
+MAX_TURNS = 8
+MAX_LLM_TOOL_CALLS = 10
 # Tools the LLM may choose. introducing_commit is slow and only offered when the question asks
 # who introduced something; advisory_fanout is a subset of graph_blast_radius.
 AGENT_TOOLS = ["recall_investigations", "scan_public_repo", "exposure_evidence", "cut_points", "graph_blast_radius",
@@ -181,7 +182,9 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
                     seen[key] = compact
                     return compact
 
-                for _ in range(MAX_STEPS):
+                llm_tool_calls = 0
+                budget_reached = False
+                for _ in range(MAX_TURNS):
                     message, provider, model = await chat_with_tools(messages, tools)
                     calls = message.get("tool_calls") or []
                     if not calls:
@@ -193,6 +196,12 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
                     messages.append({"role": "assistant", "content": message.get("content") or "", "tool_calls": calls})
                     reason = _reason(message)
                     for call in calls:
+                        if llm_tool_calls >= MAX_LLM_TOOL_CALLS:
+                            output = json.dumps({"error": "tool budget reached"})
+                            messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+                            budget_reached = True
+                            continue
+                        llm_tool_calls += 1
                         name = call["function"]["name"]
                         try:
                             arguments = json.loads(call["function"].get("arguments") or "{}")
@@ -201,6 +210,16 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
                         output = (await run_tool(name, arguments, "llm", reason) if name in offered
                                   else json.dumps({"error": f"tool {name} is not available"}))
                         messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+                    if llm_tool_calls >= MAX_LLM_TOOL_CALLS:
+                        budget_reached = True
+                        break
+                if budget_reached:
+                    trace.append({"step": len(trace) + 1, "tool": "tool_budget", "arguments": {},
+                                  "selected_by": "guard", "reason": "tool budget reached",
+                                  "status": "budget_reached", "output": "tool budget reached"})
+                    message, provider, model = await chat_with_tools(messages, tools, tool_choice="none")
+                    text = (message.get("content") or "").translate({0x202f: " ", 0x00a0: " ", 0x2011: "-", 0x2010: "-"})
+                    answer = text.replace("**", "").replace("`", "").strip() or None
                 # Guards: the UI and the saved memory need these two pieces of evidence even if the
                 # model skipped them. They are marked as guard steps, not as the model's choice.
                 if root and "scan_public_repo" not in evidence:
@@ -224,7 +243,7 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
     output = {"summary": answer, "summary_source": provider, "tool_trace": trace, "evidence": evidence,
               "limits": "Package and declared network paths only; function-level reachability and runtime traffic are not measured.",
               "agent": {"mode": "llm", "model": model, "steps": len(trace),
-                        "chosen_by_llm": sum(1 for s in trace if s["selected_by"] == "llm")}}
+                        "chosen_by_llm": llm_tool_calls}}
     output["agent"]["saved_investigation"] = _remember(root, advisory, question, output)
     return output
 
@@ -245,7 +264,12 @@ def _remember(root: str | None, advisory: str, question: str, output: dict) -> s
     """Write this investigation into the graph so the next session can recall it."""
     if not root:
         return None
-    results = output.get("evidence", {}).get("scan_public_repo", {}).get("results", [])
+    scan = output.get("evidence", {}).get("scan_public_repo", {})
+    results = scan.get("results") if isinstance(scan, dict) else None
+    scan_succeeded = any(step.get("tool") == "scan_public_repo" and step.get("status") == "ok"
+                         for step in output.get("tool_trace", []))
+    if not scan_succeeded or not isinstance(results, list) or not results:
+        return None
     try:
         return GraphStore().save_investigation(root, advisory, {
             "question": question[:500], "answer": (output.get("summary") or "")[:1500],

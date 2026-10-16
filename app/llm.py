@@ -26,7 +26,7 @@ def _reset_seconds(response: httpx.Response) -> float:
     return total + (float(number) if number else 0.0)
 
 
-async def chat_with_tools(messages: list[dict], tools: list[dict]) -> tuple[dict, str, str]:
+async def chat_with_tools(messages: list[dict], tools: list[dict], tool_choice: str = "auto") -> tuple[dict, str, str]:
     """One agent turn with OpenAI-style function calling. Returns (assistant message, provider, model).
     Free tiers allow ~8k tokens/minute, so a 429 waits for the reset instead of failing the run."""
     import asyncio
@@ -42,7 +42,7 @@ async def chat_with_tools(messages: list[dict], tools: list[dict]) -> tuple[dict
         for name, key, url, model in providers:
             if not key:
                 continue
-            payload = {"model": model, "messages": messages, "tools": tools, "tool_choice": "auto", "temperature": 0.1}
+            payload = {"model": model, "messages": messages, "tools": tools, "tool_choice": tool_choice, "temperature": 0.1}
             if name == "groq":
                 payload.update(reasoning_effort="low", max_completion_tokens=1200)
             for _ in range(4):

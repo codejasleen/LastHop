@@ -16,6 +16,8 @@ async def scan_public_repo(repo: str, advisory: str) -> dict:
     """Refresh a public GitHub repo at its latest commit and trace one CVE/GHSA through FalkorDB."""
     result = await scan_live(LiveScanRequest(repo=repo, advisory=advisory))
     for item in result["results"]:
+        # Keep tool output small for free-tier models, but report the true total.
+        item["vulnerable_path_count"] = len(item["vulnerable_paths"])
         item["vulnerable_paths"] = item["vulnerable_paths"][:5]
         item["checked_paths"] = item["checked_paths"][:5]
     return result

@@ -146,7 +146,7 @@ async function investigate(repo, advisory, question) {
   $('submit').disabled = true;
   try {
     const data = await api('/api/agent', {method: 'POST', body: JSON.stringify({repo, advisory, question})});
-    const entry = {id: `${Date.now()}`, repo, advisory: data.evidence.scan_public_repo.advisory.id, question, at: new Date().toISOString(), data};
+    const entry = {id: `${Date.now()}`, repo: data.evidence.scan_public_repo.source?.repo || repo, advisory: data.evidence.scan_public_repo.advisory.id, question, at: new Date().toISOString(), data};
     remember(entry);
     openInvestigation(entry);
     refreshSidebar();
@@ -197,7 +197,12 @@ function renderHeader(entry, scan) {
   ];
   const fan = entry.data.evidence.advisory_fanout;
   if (fan) labels.push(`<span class="label accent">Graph fan-out: ${fan.count} project${fan.count === 1 ? '' : 's'}</span>`);
-  $('r-labels').innerHTML = labels.join('');
+  // Say plainly what was NOT scanned, so a clean result is never mistaken for full coverage.
+  const scanned = (src.project_paths || []).map(p => p === '.' ? 'repository root' : p);
+  const skipped = src.other_manifests || [];
+  const coverage = scanned.length ? `<div class="coverage">Scanned: ${esc(scanned.join(', '))}`
+    + (skipped.length ? ` · <b>Not analyzed:</b> ${esc(skipped.join(', '))} (unsupported ecosystem)` : '') + '</div>' : '';
+  $('r-labels').innerHTML = labels.join('') + coverage;
 }
 
 function renderVerdict(entry, scan) {
@@ -274,12 +279,13 @@ function checkHtml(r, scan, idx) {
   const c = vclass(r), affected = r.vulnerable_paths?.length;
   const paths = [...(r.vulnerable_paths || [])].sort((a, b) => a.path.length - b.path.length);
   const vp = paths[0];
+  const total = r.vulnerable_path_count ?? paths.length;
   const fixes = uniqueFixes(r);
   const fixText = fixes.length ? fixes.map(f => f.strategy === 'lockfile_refresh'
     ? `${esc(f.package)} ${esc(f.before || '')} → ${esc(f.target)} <span class="muted">(fits ${esc(f.parent_name)} ${esc(f.declared_range)})</span>`
-    : `${esc(f.package)} → ${esc(f.first_patched)} <span class="muted">(manual review)</span>`).join('<br>') : '<span class="muted">No patched version in the advisory</span>';
+    : `${esc(f.package)} → ${esc(f.first_patched)} <span class="muted">· manual review${f.reason ? `: ${esc(f.reason)}` : ''}</span>`).join('<br>') : '<span class="muted">No patched version in the advisory</span>';
   const why = affected
-    ? `${exposureLine(r)}<div class="muted">${esc(vp.package)} ${esc(vp.version)} · ${vp.path.length - 1} hop${vp.path.length === 2 ? '' : 's'} · ${paths.length} path${paths.length === 1 ? '' : 's'}${fixes[0] ? ` · fix → ${esc(fixes[0].target || fixes[0].first_patched)}` : ''}</div>`
+    ? `${exposureLine(r)}<div class="muted">${esc(vp.package)} ${esc(vp.version)} · ${vp.path.length - 1} hop${vp.path.length === 2 ? '' : 's'} · ${total} path${total === 1 ? '' : 's'}${fixes[0] ? ` · fix → ${esc(fixes[0].target || fixes[0].first_patched)}` : ''}</div>`
     : `<span class="muted">${esc(r.explanation)}</span>`;
   const priority = r.priority && r.priority !== 'None' ? r.priority : null;
   const chip = affected ? `<span class="label ${c === 'bad' ? 'danger' : 'attention'} check-chip">${esc(priority && priority.startsWith('P') ? `${priority} provisional` : (VERDICT[r.verdict] || {}).label || r.verdict)}</span>`
@@ -288,8 +294,8 @@ function checkHtml(r, scan, idx) {
   const decision = r.prior_decisions?.[0];
   const detail = affected ? `<div class="check-detail">
       <div class="detail-grid">
-        <div><div class="detail-title">Dependency path · shortest of ${paths.length}</div>${treeHtml(vp.path, r, vp)}
-          ${paths.length > 1 ? `<details class="raw more-paths"><summary>${paths.length - 1} more path${paths.length === 2 ? '' : 's'}</summary>${paths.slice(1).map(p => treeHtml(p.path, r, p)).join('<br>')}</details>` : ''}</div>
+        <div><div class="detail-title">Dependency path · shortest of ${total}</div>${treeHtml(vp.path, r, vp)}
+          ${paths.length > 1 ? `<details class="raw more-paths"><summary>${total - 1} more path${total === 2 ? '' : 's'}${total > paths.length ? ` (next ${paths.length - 1} shown)` : ''}</summary>${paths.slice(1).map(p => treeHtml(p.path, r, p)).join('<br>')}</details>` : ''}</div>
         <div><div class="detail-title">Exposure path · from deployment manifests</div>
           ${svcWithPath ? stepsHtml(svcWithPath) : '<div class="callout attention">No deployment evidence for this project, so exposure is unknown. BlastRadius does not guess.</div>'}</div>
       </div>

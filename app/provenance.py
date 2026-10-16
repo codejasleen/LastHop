@@ -16,7 +16,7 @@ from .sources import Snapshot, _headers
 
 
 async def trace_lockfile_pin(snapshot: Snapshot, package_path: str, version: str) -> dict[str, Any]:
-    """Verify the changed package key against a parent commit, up to 50 lockfile commits."""
+    """Verify the changed package key against an available parent commit."""
     root_repo = snapshot.repo.split("::")[0]
     if snapshot.manager != "npm" or not isinstance(snapshot.lockfile.get("packages"), dict):
         return {"status": "unsupported", "reason": "Provenance currently needs a package-lock v2/v3 package key."}
@@ -48,8 +48,9 @@ async def trace_lockfile_pin(snapshot: Snapshot, package_path: str, version: str
     return result
 
 
-def _git_history_fallback(repo: str, sha: str, lockfile_path: str, package_path: str, version: str) -> dict[str, Any]:
-    """Verify the exact lockfile change with bounded public Git history."""
+def _git_history_fallback(repo: str, sha: str, lockfile_path: str, package_path: str, version: str,
+                          remote_url: str | None = None) -> dict[str, Any]:
+    """Verify the exact lockfile change, deepening a shallow clone when needed."""
     def run(cwd: Path, *args: str) -> str:
         process = subprocess.run(["git", "-c", "http.sslBackend=openssl", *args], cwd=cwd,
                                  capture_output=True, text=True, timeout=60, check=False)
@@ -61,37 +62,48 @@ def _git_history_fallback(repo: str, sha: str, lockfile_path: str, package_path:
         checkout = root / "source"
         try:
             run(root, "clone", "--filter=blob:none", "--no-checkout", "--depth=100",
-                f"https://github.com/{repo}.git", str(checkout))
+                remote_url or f"https://github.com/{repo}.git", str(checkout))
             if run(checkout, "rev-parse", "HEAD").strip() != sha:
                 return {"status": "unverified", "reason": "Repository head changed before history could be checked."}
-            commits = run(checkout, "log", "-50", "--format=%H", "--", lockfile_path).splitlines()
-            for commit in commits:
-                if not re.fullmatch(r"[0-9a-f]{40}", commit):
-                    continue
-                try:
-                    after = json.loads(run(checkout, "show", f"{commit}:{lockfile_path}"))
-                    after_version = (after.get("packages") or {}).get(package_path, {}).get("version")
-                    if after_version != version:
+            depths = (100, 500, 2000)
+            for index, depth in enumerate(depths):
+                if index:
+                    run(checkout, "fetch", "--deepen=" + str(depth - depths[index - 1]), "origin")
+                commits = run(checkout, "log", "-500", "--format=%H", "--", lockfile_path).splitlines()
+                shallow = run(checkout, "rev-parse", "--is-shallow-repository").strip() == "true"
+                for commit in commits:
+                    if not re.fullmatch(r"[0-9a-f]{40}", commit):
                         continue
-                    parents = run(checkout, "rev-list", "--parents", "-n", "1", commit).split()
-                    parent_sha = parents[1] if len(parents) > 1 else None
-                    before = json.loads(run(checkout, "show", f"{parent_sha}:{lockfile_path}")) if parent_sha else {}
-                    previous = (before.get("packages") or {}).get(package_path, {}).get("version")
-                    if previous == version:
+                    try:
+                        after = json.loads(run(checkout, "show", f"{commit}:{lockfile_path}"))
+                        after_version = (after.get("packages") or {}).get(package_path, {}).get("version")
+                        if after_version != version:
+                            continue
+                        parents = run(checkout, "rev-list", "--parents", "-n", "1", commit).split()
+                        parent_sha = parents[1] if len(parents) > 1 else None
+                        if parent_sha is None and shallow:
+                            # Git hides the parent of a shallow boundary commit. Its apparent
+                            # file addition cannot establish when this version was introduced.
+                            break
+                        before = json.loads(run(checkout, "show", f"{parent_sha}:{lockfile_path}")) if parent_sha else {}
+                        previous = (before.get("packages") or {}).get(package_path, {}).get("version")
+                        if previous == version:
+                            continue
+                        author = run(checkout, "show", "-s", "--format=%an", commit).strip()
+                        subject = run(checkout, "show", "-s", "--format=%s", commit).strip()
+                        pr_match = re.search(r"\(#(\d+)\)$", subject)
+                        pull_request = ({"number": int(pr_match.group(1)),
+                                         "url": f"https://github.com/{repo}/pull/{pr_match.group(1)}",
+                                         "author": None, "verification": "commit_subject"} if pr_match else None)
+                        return {"status": "verified", "source": "git_history", "commit": commit,
+                                "commit_url": f"https://github.com/{repo}/commit/{commit}", "previous_version": previous,
+                                "version": version, "package_path": package_path, "lockfile_path": lockfile_path,
+                                "author": author, "pull_request": pull_request, "reviewers": [],
+                                "note": "PR and reviewer verification is pending GitHub API access."}
+                    except (ValueError, KeyError, RuntimeError):
                         continue
-                    author = run(checkout, "show", "-s", "--format=%an", commit).strip()
-                    subject = run(checkout, "show", "-s", "--format=%s", commit).strip()
-                    pr_match = re.search(r"\(#(\d+)\)$", subject)
-                    pull_request = ({"number": int(pr_match.group(1)),
-                                     "url": f"https://github.com/{repo}/pull/{pr_match.group(1)}",
-                                     "author": None, "verification": "commit_subject"} if pr_match else None)
-                    return {"status": "verified", "source": "git_history", "commit": commit,
-                            "commit_url": f"https://github.com/{repo}/commit/{commit}", "previous_version": previous,
-                            "version": version, "package_path": package_path, "lockfile_path": lockfile_path,
-                            "author": author, "pull_request": pull_request, "reviewers": [],
-                            "note": "PR and reviewer verification is pending GitHub API access."}
-                except (ValueError, KeyError, RuntimeError):
-                    continue
+                if not shallow or len(commits) >= 500:
+                    break
         except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
             return {"status": "unverified", "reason": f"Git history was unavailable: {exc.__class__.__name__}"}
-    return {"status": "unverified", "reason": "No introducing commit was verified within the latest 50 lockfile commits."}
+    return {"status": "unverified", "reason": "No introducing commit was verified within 2,000 history commits or 500 lockfile changes."}

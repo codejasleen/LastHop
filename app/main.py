@@ -248,8 +248,9 @@ async def enrich_live_result(graph: GraphStore, snapshot, advisory: Advisory, re
     for candidate in result["fix_candidates"]:
         try:
             candidate.update(lockfile_refresh_plan(snapshot, advisory, candidate["package"]))
-        except ValueError:
+        except ValueError as exc:
             candidate["strategy"] = "manual_review"
+            candidate["reason"] = str(exc)
     analyzed = set()
     for vulnerable in result["vulnerable_paths"][:3]:
         target_path = vulnerable["dependency_id"].removeprefix(snapshot.repo + ":")

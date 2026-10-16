@@ -99,6 +99,9 @@ input::placeholder, textarea::placeholder { color: var(--subtle); }
 .qtable th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; padding: 8px 16px; border-bottom: 1px solid var(--border); }
 .qtable td { padding: 8px 16px; border-bottom: 1px solid var(--border-muted); vertical-align: top; }
 .qtable tr.other td { background: #388bfd0d; }
+.blank-graph { padding: 24px 16px; color: var(--muted); font-size: 14px; }
+.blank-graph b { color: var(--fg); }
+.tab-intro { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
 .coverage { flex-basis: 100%; font-size: 12px; color: var(--muted); margin-top: 4px; }
 .coverage b { color: #e3b341; font-weight: 600; }
 .label.done { color: #d2a8ff; background: #ab7df826; border-color: #ab7df866; }

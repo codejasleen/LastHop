@@ -17,7 +17,7 @@ from .graph import GraphStore, dependency_graph
 from .fixes import build_preview, create_draft_pr, lockfile_refresh_plan
 from .module_trace import fetch_parent_trace
 from .risk_signals import assign_priority, fetch_risk_signals
-from .sources import fetch_public_projects, fetch_public_repo
+from .sources import SourceAcquisitionError, fetch_public_projects, fetch_public_repo
 from .webhooks import verify_push
 
 
@@ -308,7 +308,7 @@ async def investigate(request: InvestigationRequest) -> dict:
         order = {"affected_exposed": 0, "declared_exposed": 1, "affected_exposure_unknown": 2, "declared_exposure_unknown": 3, "affected_internal_declared": 4, "declared_internal": 4, "insufficient_evidence": 5, "not_affected_version": 6, "not_present": 7, "not_applicable": 8}
         results.sort(key=lambda row: (order[row["verdict"]], row["repo"]))
         return {
-            "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url},
+            "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url, "packages": sorted({f"{p.ecosystem}:{p.name}" for p in advisory.packages})},
             "results": results,
         }
     except HTTPException:
@@ -335,15 +335,18 @@ async def scan_live(request: LiveScanRequest) -> dict:
         deployment = graph.ingest_deployments(snapshots[0].repo.split("::")[0], snapshots)
         signals = await fetch_risk_signals(advisory.identifier)
         results = []
-        for snapshot in snapshots:
+        for snapshot, stored in zip(snapshots, imported):
             result = investigate_one(graph, snapshot.repo, advisory)
+            # How many installed packages were searched: the proof behind "not present".
+            result["dependency_count"] = stored["dependencies"]
+            result["manifest"] = snapshot.lockfile_path
             await enrich_live_result(graph, snapshot, advisory, result)
             result["priority"], result["priority_reasons"] = assign_priority(result, signals)
             results.append(result)
         order = {"affected_exposed": 0, "declared_exposed": 1, "affected_exposure_unknown": 2, "declared_exposure_unknown": 3, "affected_internal_declared": 4, "declared_internal": 4, "insufficient_evidence": 5, "not_affected_version": 6, "not_present": 7, "not_applicable": 8}
         results.sort(key=lambda row: (order[row["verdict"]], row["repo"]))
         return {
-            "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url},
+            "advisory": {"id": advisory.identifier, "summary": advisory.summary, "severity": advisory.severity, "url": advisory.url, "packages": sorted({f"{p.ecosystem}:{p.name}" for p in advisory.packages})},
             "risk_signals": signals,
             "results": results,
             "source": {"repo": snapshots[0].repo.split("::")[0], "sha": snapshots[0].sha, "scanned_at": datetime.now(timezone.utc).isoformat(),
@@ -356,6 +359,8 @@ async def scan_live(request: LiveScanRequest) -> dict:
         raise
     except (ValueError, LookupError) as exc:
         raise HTTPException(400, str(exc)) from exc
+    except SourceAcquisitionError as exc:
+        raise HTTPException(503, str(exc)) from exc
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             raise HTTPException(404, "GitHub repository or advisory was not found") from exc

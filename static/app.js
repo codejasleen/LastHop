@@ -191,19 +191,31 @@ function renderHeader(entry, scan) {
     dep ? `${dep.workloads} workloads · ${dep.public_routes} public route${dep.public_routes === 1 ? '' : 's'}` : 'no deployment manifests',
   ].join(' · ');
   const sev = (a.severity || 'unknown').toLowerCase();
+  // Severity, KEV and EPSS describe the vulnerability itself, not this repo. Only colour
+  // them as alarms when something here is actually affected.
+  const hit = scan.results.some(r => r.vulnerable_paths?.length);
+  const sevClass = !hit ? '' : ['critical', 'high'].includes(sev) ? 'danger' : sev === 'moderate' || sev === 'medium' ? 'attention' : '';
   const labels = [
-    `<span class="label ${['critical', 'high'].includes(sev) ? 'danger' : sev === 'moderate' || sev === 'medium' ? 'attention' : ''}">Severity: ${esc(sev)}</span>`,
-    risk.kev === true ? '<span class="label danger">CISA KEV: actively exploited</span>'
-      : risk.kev === false ? '<span class="label">Not in CISA KEV</span>' : '<span class="label">KEV unknown</span>',
-    risk.epss != null ? `<span class="label ${risk.epss_percentile >= 0.9 ? 'danger' : ''}">EPSS ${(risk.epss * 100).toFixed(2)}% · ${Math.round((risk.epss_percentile || 0) * 100)}th pct</span>` : '<span class="label">EPSS unknown</span>',
+    `<span class="label ${sevClass}" title="Severity the advisory assigns to the vulnerability in general (CVSS). It says how bad the flaw is if you are affected, not whether you are.">Advisory severity: ${esc(sev)}</span>`,
+    risk.kev === true ? `<span class="label ${hit ? 'danger' : ''}" title="CISA Known Exploited Vulnerabilities: the US government's list of flaws attackers are using right now.">CISA KEV: actively exploited</span>`
+      : risk.kev === false ? '<span class="label" title="CISA Known Exploited Vulnerabilities: the US government\'s list of flaws attackers are using right now. This one is not on it.">Not in CISA KEV</span>' : '<span class="label">KEV unknown</span>',
+    risk.epss != null ? `<span class="label ${hit && risk.epss_percentile >= 0.9 ? 'danger' : ''}" title="EPSS (FIRST.org): estimated probability this flaw is exploited anywhere in the next 30 days, and how it ranks against all CVEs.">EPSS ${(risk.epss * 100).toFixed(2)}% · ${Math.round((risk.epss_percentile || 0) * 100)}th pct</span>` : '<span class="label">EPSS unknown</span>',
   ];
   const fan = entry.data.evidence.advisory_fanout;
   if (fan) labels.push(`<span class="label accent">Graph fan-out: ${fan.count} project${fan.count === 1 ? '' : 's'}</span>`);
   // Say plainly what was NOT scanned, so a clean result is never mistaken for full coverage.
   const scanned = (src.project_paths || []).map(p => p === '.' ? 'repository root' : p);
-  const skipped = src.other_manifests || [];
+  const LANG = {'go.mod': 'Go', 'pom.xml': 'Java', 'build.gradle': 'Java', 'build.gradle.kts': 'Java', 'Cargo.lock': 'Rust',
+                'Gemfile.lock': 'Ruby', 'poetry.lock': 'Python (Poetry)', 'uv.lock': 'Python (uv)'};
+  const byLang = {};
+  for (const path of src.other_manifests || []) {
+    const parts = path.split('/'), file = parts.pop();
+    const lang = file.endsWith('.csproj') ? 'C#' : LANG[file] || file;
+    (byLang[lang] ||= new Set()).add(parts.filter(p => p !== 'src').pop() || 'repository root');
+  }
+  const skipped = Object.entries(byLang).map(([lang, names]) => `${[...names].join(', ')} (${lang})`);
   const coverage = scanned.length ? `<div class="coverage">Scanned: ${esc(scanned.join(', '))}`
-    + (skipped.length ? ` · <b>Not analyzed:</b> ${esc(skipped.join(', '))} (unsupported ecosystem)` : '') + '</div>' : '';
+    + (skipped.length ? ` · <b>Not analyzed (unsupported language):</b> ${esc(skipped.join(' · '))}` : '') + '</div>' : '';
   $('r-labels').innerHTML = labels.join('') + coverage;
 }
 
@@ -320,7 +332,7 @@ function checkHtml(r, scan, idx) {
     : `<span class="label success check-chip">${esc((VERDICT[r.verdict] || {}).label || r.verdict)}</span>`;
   const svcWithPath = (r.services || []).find(s => s.exposure_path?.length);
   const decision = r.prior_decisions?.[0];
-  const detail = affected ? `<div class="check-detail">
+  const detail = !affected ? cleanProofHtml(r, scan) : `<div class="check-detail">
       <div class="detail-grid">
         <div><div class="detail-title">Dependency path · shortest of ${total}</div>${treeHtml(vp.path, r, vp)}
           ${paths.length > 1 ? `<details class="raw more-paths"><summary>${total - 1} more path${total === 2 ? '' : 's'}${total > paths.length ? ` (next ${paths.length - 1} shown)` : ''}</summary>${paths.slice(1).map(p => treeHtml(p.path, r, p)).join('<br>')}</details>` : ''}</div>
@@ -343,15 +355,33 @@ function checkHtml(r, scan, idx) {
         ${r.provenance_supported ? `<button class="btn btn-sm" data-provenance="${idx}" type="button">Who introduced it?</button>` : ''}
       </div>
       <div class="prov" id="prov-${idx}"></div>
-    </div>` : '';
+    </div>`;
   return `<div class="check" data-idx="${idx}">
-    <div class="check-row ${affected ? '' : 'static'}" ${affected ? 'data-toggle' : ''}>
+    <div class="check-row ${detail ? '' : 'static'}" ${detail ? 'data-toggle' : ''}>
       <span class="s-icon s-${c}">${ICON[c]}</span>
       <div style="min-width:0"><div class="check-name">${esc(projectName(r.repo))}</div><div class="check-sub">${esc(projectSub(r, scan))}</div></div>
       <div class="check-why">${why}</div>
       ${chip}
-      <span class="chev">${affected ? '›' : ''}</span>
+      <span class="chev">${detail ? '›' : ''}</span>
     </div>${detail}</div>`;
+}
+
+/* The proof behind a clean result: what exactly was searched, at which commit. */
+function cleanProofHtml(r, scan) {
+  const sha = (scan.source?.sha || '').slice(0, 7);
+  const where = r.manifest ? `<code>${esc(r.manifest)}</code>` : 'the project manifest';
+  const ecosystem = r.repo.includes('#pip') ? 'PyPI' : 'npm';
+  const packages = (scan.advisory.packages || []).filter(p => p.startsWith(`${ecosystem}:`)).map(p => p.slice(ecosystem.length + 1));
+  const named = packages.length ? packages.map(p => `<code>${esc(p)}</code>`).join(', ') : 'the advisory\'s package';
+  if (r.verdict === 'not_present') {
+    return `<div class="check-detail"><div class="callout success"><b>Proof:</b> searched ${esc(r.dependency_count ?? '?')} packages from ${where} at commit <code>${esc(sha)}</code>. ${named} ${packages.length === 1 ? 'is' : 'are'} not among them, so this scanned project has no dependency path to that package.</div></div>`;
+  }
+  if (r.verdict === 'not_affected_version') {
+    const recordedAs = ecosystem === 'PyPI' ? 'is pinned' : 'is installed';
+    const rows = (r.checked_paths || []).map(p => `<li><code>${esc(p.package)} ${esc(p.version)}</code> ${recordedAs}; the affected range is <code>${esc(p.range)}</code>, so this version is outside it.</li>`).join('');
+    return `<div class="check-detail"><div class="callout success"><b>Proof:</b> the package is present in ${where} at commit <code>${esc(sha)}</code>, at a version outside this advisory's affected range:<ul>${rows}</ul></div></div>`;
+  }
+  return '';
 }
 
 function renderOverview(scan) {
@@ -365,7 +395,7 @@ function renderOverview(scan) {
       <div><div class="check-name">${skip.length} project${skip.length === 1 ? '' : 's'} skipped</div><div class="check-sub">different package ecosystem</div></div>
       <div class="check-why muted">${esc(skip.map(x => projectName(x.r.repo)).join(', '))}</div><span></span><span></span></div></div>` : '';
   $('tab-overview').innerHTML = `<div class="box checks">
-    <div class="box-header"><span>${rel.length} project${rel.length === 1 ? '' : 's'} checked · ${bad} reachable from the internet</span><span class="muted small">Click a row for the proof</span></div>
+    <div class="box-header"><span>${rel.length} project${rel.length === 1 ? '' : 's'} checked · ${bad} reachable from the internet</span>${rel.some(x => x.r.verdict !== 'insufficient_evidence') ? '<span class="muted small">Click a row for its proof</span>' : ''}</div>
     ${rel.map(x => checkHtml(x.r, scan, x.idx)).join('')}${skipRow}</div>`;
   const first = $('tab-overview').querySelector('.check [data-toggle]');
   if (first) first.parentElement.classList.add('open');
@@ -444,7 +474,18 @@ function graphElements(entry) {
 function drawGraph() {
   if (!current) return;
   if (!window.cytoscape) { $('cy').innerHTML = '<p class="muted" style="padding:16px">Graph library could not load (offline?). The same paths are listed in Overview.</p>'; return; }
-  if (cy) cy.destroy();
+  if (cy) { cy.destroy(); cy = null; }
+  const affectedHere = current.data.evidence.scan_public_repo.results.filter(r => r.vulnerable_paths?.length);
+  if (!affectedHere.length) {
+    // Nothing in this repo reaches the package: draw nothing rather than a meaningless picture.
+    const others = otherRepoRows(current).length;
+    $('cy').style.height = 'auto';
+    $('cy').innerHTML = `<div class="blank-graph"><b>Nothing to draw for this repo.</b> No dependency path in any scanned project reaches an affected package, so there is no identified blast radius here.${others ? ' The query below shows other repos in the graph with package versions affected by this advisory.' : ''}</div>`;
+    $('graph-note').textContent = '';
+    renderGraphQuery(current);
+    return;
+  }
+  $('cy').innerHTML = '';
   const {elements, rows} = graphElements(current);
   $('cy').style.height = `${Math.max(360, rows * ROW_H + 60)}px`;
   cy = cytoscape({
@@ -598,7 +639,16 @@ async function provenance(idx, button) {
 }
 
 // ---------- tabs + events ----------
+const TAB_INTRO = {
+  overview: 'One row per scanned project: ✕ affected and reachable from the internet, ! affected but not proven reachable, ✓ not affected. Open a row to see its evidence.',
+  graph: 'How the internet reaches each affected service, and how the vulnerable package reaches that service, drawn from FalkorDB. Below it, the single Cypher query that computes the blast radius across every repo in the graph.',
+  agent: 'Every MCP tool call made for this investigation, in order, with its raw output, then the written answer. The answer may only use facts from these tool outputs.',
+  files: 'Proposed fixes as lockfile diffs. Nothing changes until a person enters the approval key; then a draft pull request is opened, never merged.',
+  history: 'Decisions your team recorded for this advisory (stored in FalkorDB and recalled on the next investigation), and which commit introduced the vulnerable version.',
+};
+
 function selectTab(name) {
+  $('tab-intro').textContent = TAB_INTRO[name] || '';
   for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t.dataset.tab === name);
   for (const p of document.querySelectorAll('.tab-panel')) p.classList.toggle('hidden', p.id !== `tab-${name}`);
   if (name === 'graph') drawGraph();

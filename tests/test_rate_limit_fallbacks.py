@@ -4,9 +4,12 @@ import json
 import zipfile
 
 import httpx
+import pytest
+from fastapi import HTTPException
 
-from app.advisories import fetch_advisory, is_affected
-from app.sources import fetch_public_projects
+from app.advisories import Advisory, AffectedPackage, fetch_advisory, is_affected
+from app.main import LiveScanRequest, scan_live
+from app.sources import Snapshot, SourceAcquisitionError, SourceArchiveError, fetch_public_projects
 
 
 def test_public_archive_fallback_keeps_commit_and_project_scope(monkeypatch):
@@ -17,6 +20,8 @@ def test_public_archive_fallback_keeps_commit_and_project_scope(monkeypatch):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("demo-HEAD/go.mod", "module example.com/demo\n")
+        archive.writestr("demo-HEAD/src/payments/go.mod", "module example.com/payments\n")
+        archive.writestr("demo-HEAD/tests/pom.xml", "<project/>\n")
         archive.writestr("demo-HEAD/docs/package-lock.json", json.dumps(lock))
         archive.writestr("demo-HEAD/testdata/yarn.lock", "# yarn lockfile v1\n")
         archive.comment = b"a" * 40
@@ -35,7 +40,67 @@ def test_public_archive_fallback_keeps_commit_and_project_scope(monkeypatch):
     assert len(projects) == 1
     assert projects[0].repo == "acme/demo::docs"
     assert projects[0].sha == "a" * 40
-    assert projects[0].other_manifests == ("go.mod",)
+    assert projects[0].other_manifests == ("go.mod", "src/payments/go.mod")
+
+
+def test_rate_limited_api_and_failed_archive_use_shallow_git(monkeypatch):
+    events = []
+    request = httpx.Request("GET", "https://api.github.com/repos/acme/demo")
+    response = httpx.Response(403, request=request, headers={"X-RateLimit-Remaining": "0"})
+    expected = [Snapshot("acme/demo", "a" * 40, {}, {}, None, [], "public git")]
+
+    async def api(_repo):
+        raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    async def archive(_repo):
+        events.append("archive")
+        raise SourceArchiveError("codeload unavailable")
+
+    async def git(_repo):
+        events.append("git")
+        return expected
+
+    monkeypatch.setattr("app.sources._fetch_public_projects_api", api)
+    monkeypatch.setattr("app.sources._fetch_public_projects_archive", archive)
+    monkeypatch.setattr("app.sources._fetch_public_projects_git", git)
+    assert asyncio.run(fetch_public_projects("acme/demo")) == expected
+    assert events == ["archive", "git"]
+
+
+def test_both_public_fallbacks_fail_with_actionable_error(monkeypatch):
+    request = httpx.Request("GET", "https://api.github.com/repos/acme/demo")
+    response = httpx.Response(403, request=request, headers={"X-RateLimit-Remaining": "0"})
+
+    async def api(_repo):
+        raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    async def archive(_repo):
+        raise SourceArchiveError("codeload unavailable")
+
+    async def git(_repo):
+        raise SourceAcquisitionError("git unavailable")
+
+    monkeypatch.setattr("app.sources._fetch_public_projects_api", api)
+    monkeypatch.setattr("app.sources._fetch_public_projects_archive", archive)
+    monkeypatch.setattr("app.sources._fetch_public_projects_git", git)
+    with pytest.raises(SourceAcquisitionError, match="Set GITHUB_TOKEN"):
+        asyncio.run(fetch_public_projects("acme/demo"))
+
+
+def test_scan_reports_source_fallback_failure_as_service_unavailable(monkeypatch):
+    async def advisory(_identifier):
+        return Advisory("CVE-2026-12143", "Test advisory", "high", "", [
+            AffectedPackage("form-data", "<2.5.6", "2.5.6")])
+
+    async def projects(_repo):
+        raise SourceAcquisitionError("GitHub API rate limited; public fallbacks unavailable")
+
+    monkeypatch.setattr("app.main.fetch_advisory", advisory)
+    monkeypatch.setattr("app.main.fetch_public_projects", projects)
+    with pytest.raises(HTTPException) as failure:
+        asyncio.run(scan_live(LiveScanRequest(repo="acme/demo", advisory="CVE-2026-12143")))
+    assert failure.value.status_code == 503
+    assert "fallbacks unavailable" in failure.value.detail
 
 
 def test_osv_fallback_resolves_cve_alias_and_exact_npm_range(monkeypatch):

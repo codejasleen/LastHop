@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import io
 import os
 import re
 import json
+import subprocess
+import tempfile
 import zipfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
@@ -19,6 +23,14 @@ import yaml
 
 REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _project_cache: dict[str, tuple[float, list[Snapshot]]] = {}
+
+
+class SourceArchiveError(Exception):
+    """The public ZIP could not be acquired or verified."""
+
+
+class SourceAcquisitionError(Exception):
+    """Every public-source route failed after GitHub API throttling."""
 
 
 def normalize_repo(repo: str) -> str:
@@ -146,9 +158,15 @@ async def _snapshots_from_files(
     from .deployments import parse_kubernetes
     excluded = {"node_modules", "vendor", "testdata", "fixtures", "__fixtures__"}
     paths = {path for path in paths if not excluded.intersection(path.split("/"))}
-    other_manifests = tuple(sorted(paths.intersection({
-        "go.mod", "Cargo.lock", "poetry.lock", "uv.lock", "Gemfile.lock", "pom.xml"
-    })))
+    # Manifests of ecosystems we cannot scan, anywhere in the repo (not only the root), so the UI
+    # can say exactly which services were NOT analyzed. Test projects are left out.
+    unsupported = {"go.mod", "Cargo.lock", "poetry.lock", "uv.lock", "Gemfile.lock", "pom.xml",
+                   "build.gradle", "build.gradle.kts"}
+    other_manifests = tuple(sorted(
+        path for path in paths
+        if (path.rsplit("/", 1)[-1] in unsupported or path.endswith(".csproj"))
+        and not {"test", "tests"}.intersection(path.lower().split("/"))
+    ))
     locks: dict[str, tuple[str, str]] = {}
     ambiguous: set[str] = set()
     for path in sorted(paths):
@@ -164,7 +182,7 @@ async def _snapshots_from_files(
         raise ValueError(f"Multiple package-manager lockfiles in {', '.join(sorted(ambiguous))}; choose one lockfile before scanning")
     requirements = sorted(path for path in paths if path.rsplit("/", 1)[-1] == "requirements.txt")
     if not locks and not requirements:
-        detail = f" Found {', '.join(other_manifests)} at the root." if other_manifests else ""
+        detail = f" Found {', '.join(other_manifests)} (unsupported ecosystems)." if other_manifests else ""
         raise ValueError("No supported npm, pnpm, Yarn lockfile or Python requirements.txt was found; no CVE verdict was made." + detail)
     if len(locks) > 20:
         raise ValueError("More than 20 lockfiles found; narrow project selection is not supported yet")
@@ -254,24 +272,28 @@ async def _snapshots_from_files(
 
 async def _fetch_public_projects_archive(repo: str) -> list[Snapshot]:
     """Use a bounded public source archive when GitHub's API quota is exhausted."""
-    async with httpx.AsyncClient(timeout=40, follow_redirects=False, headers={"User-Agent": "BlastRadius-demo"}) as client:
-        async with client.stream("GET", f"https://codeload.github.com/{repo}/zip/HEAD") as response:
-            response.raise_for_status()
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in response.aiter_bytes():
-                size += len(chunk)
-                if size > 30_000_000:
-                    raise ValueError("Public source archive exceeds the 30 MB scan limit")
-                chunks.append(chunk)
-    with zipfile.ZipFile(io.BytesIO(b"".join(chunks))) as archive:
+    try:
+        async with httpx.AsyncClient(timeout=40, follow_redirects=True, headers={"User-Agent": "BlastRadius-demo"}) as client:
+            async with client.stream("GET", f"https://codeload.github.com/{repo}/zip/HEAD") as response:
+                response.raise_for_status()
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > 30_000_000:
+                        raise SourceArchiveError("Public source archive exceeds the 30 MB scan limit")
+                    chunks.append(chunk)
+        archive = zipfile.ZipFile(io.BytesIO(b"".join(chunks)))
+    except (httpx.HTTPError, zipfile.BadZipFile) as exc:
+        raise SourceArchiveError("Public source archive was unavailable") from exc
+    with archive:
         sha = archive.comment.decode("ascii", errors="ignore")
         if not re.fullmatch(r"[0-9a-f]{40}", sha):
-            raise ValueError("Source archive did not identify its commit SHA; no scan was made")
+            raise SourceArchiveError("Source archive did not identify its commit SHA")
         entries: dict[str, zipfile.ZipInfo] = {}
         members = archive.infolist()
         if len(members) > 50_000:
-            raise ValueError("Public source archive has too many files")
+            raise SourceArchiveError("Public source archive has too many files")
         for member in members:
             if member.is_dir() or "/" not in member.filename:
                 continue
@@ -290,6 +312,45 @@ async def _fetch_public_projects_archive(repo: str) -> list[Snapshot]:
         return await _snapshots_from_files(repo, sha, set(entries), read_file)
 
 
+async def _fetch_public_projects_git(repo: str, remote_url: str | None = None) -> list[Snapshot]:
+    """Read only selected blobs from a shallow public Git tree if codeload is unavailable."""
+    def run(cwd: Path, *args: str, timeout: int = 30) -> bytes:
+        try:
+            process = subprocess.run(
+                ["git", "-c", "http.sslBackend=openssl", *args], cwd=cwd,
+                capture_output=True, timeout=timeout, check=False,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SourceAcquisitionError("Public Git checkout was unavailable") from exc
+        if process.returncode:
+            raise SourceAcquisitionError("Public Git checkout was unavailable")
+        return process.stdout
+
+    with tempfile.TemporaryDirectory(prefix="blastradius-source-") as folder:
+        root = Path(folder)
+        checkout = root / "repo"
+        await asyncio.to_thread(run, root, "clone", "--filter=blob:none", "--no-checkout", "--depth=1",
+                                remote_url or f"https://github.com/{repo}.git", str(checkout), timeout=90)
+        sha = (await asyncio.to_thread(run, checkout, "rev-parse", "HEAD")).decode("ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise SourceAcquisitionError("Public Git checkout did not identify a commit")
+        tree = await asyncio.to_thread(run, checkout, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+        paths = {item.decode("utf-8", errors="replace") for item in tree.split(b"\0") if item}
+        if len(paths) > 50_000:
+            raise SourceAcquisitionError("Public Git tree has too many files")
+
+        async def read_file(path: str) -> bytes | None:
+            if path not in paths:
+                return None
+            size = await asyncio.to_thread(run, checkout, "cat-file", "-s", f"HEAD:{path}")
+            if int(size) > 5_000_000:
+                raise ValueError(f"{path} is too large for the importer (5 MB limit)")
+            return await asyncio.to_thread(run, checkout, "show", f"HEAD:{path}")
+
+        return await _snapshots_from_files(repo, sha, paths, read_file)
+
+
 async def fetch_public_projects(repo: str, *, force_refresh: bool = True) -> list[Snapshot]:
     repo = normalize_repo(repo)
     cached = _project_cache.get(repo)
@@ -300,7 +361,16 @@ async def fetch_public_projects(repo: str, *, force_refresh: bool = True) -> lis
     except httpx.HTTPStatusError as exc:
         limited = exc.response.headers.get("X-RateLimit-Remaining") == "0" or "rate limit" in exc.response.text.lower()
         if exc.response.status_code == 429 or (exc.response.status_code == 403 and limited):
-            result = await _fetch_public_projects_archive(repo)
+            try:
+                result = await _fetch_public_projects_archive(repo)
+            except (SourceArchiveError, zipfile.BadZipFile):
+                try:
+                    result = await _fetch_public_projects_git(repo)
+                except SourceAcquisitionError as git_error:
+                    raise SourceAcquisitionError(
+                        "GitHub API rate limited; public archive and shallow Git fallback were unavailable. "
+                        "Set GITHUB_TOKEN or retry after the limit resets."
+                    ) from git_error
         else:
             raise
     _project_cache[repo] = (time.monotonic(), result)

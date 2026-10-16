@@ -17,7 +17,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Open <http://127.0.0.1:8000>. The FalkorDB Browser is at <http://127.0.0.1:3000>. **Try real example** scans Online Boutique. A public repo needs no sign-in. `GITHUB_TOKEN` is optional for higher API limits and required, with write permission to the target repo, for draft PR creation. When anonymous API quota is exhausted, source ingestion falls back to a bounded GitHub archive.
+Open <http://127.0.0.1:8000>. The FalkorDB Browser is at <http://127.0.0.1:3000>. **Try real example** scans Online Boutique. A public repo needs no sign-in. `GITHUB_TOKEN` is optional for higher API limits and required, with write permission to the target repo, for draft PR creation. When anonymous API quota is exhausted, source ingestion tries a bounded GitHub archive, then a shallow filtered Git checkout if the archive is unavailable.
 
 For optional Groq summaries, set `GROQ_API_KEY` in a local `.env` file (see `.env.example`). The app reads it when an agent summary runs, and Git ignores the file.
 

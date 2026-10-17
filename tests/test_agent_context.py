@@ -3,7 +3,7 @@ import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
-from app.agent import _compact, _reason, _remember, investigate
+from app.agent import _check_answer, _compact, _grounded_text, _reason, _remember, investigate
 from app.graph import GraphStore
 
 
@@ -97,7 +97,10 @@ def test_agent_limits_llm_chosen_calls_and_requests_tool_free_final(monkeypatch)
     assert choices == ["auto", "none"]
     assert result["agent"]["chosen_by_llm"] == 10
     assert any(step.get("reason") == "tool budget reached" for step in result["tool_trace"])
-    assert result["summary"] == "Final answer."
+    # The shown answer is composed from graph facts; the model's own final wording is kept in the check step.
+    check = next(step for step in result["tool_trace"] if step["tool"] == "answer_check")
+    assert json.loads(check["output"])["model_wording"] == "Final answer."
+    assert result["summary"].startswith("No repository scan results are available for CVE-2022-24999")
 
 
 def test_read_query_caps_trailing_limit_in_database_query():
@@ -133,3 +136,60 @@ def test_failed_or_partial_scan_does_not_create_memory(monkeypatch):
     output["evidence"]["scan_public_repo"]["results"] = []
     assert _remember("o/r", "CVE-2022-24999", "question", output) is None
     assert writes == []
+
+
+# Real shape of the Online Boutique CVE-2026-44432 evidence (trimmed).
+def _boutique_evidence():
+    internet = {"id": "internet"}
+    lb = {"id": "x:route", "kind": "LoadBalancer", "url": "frontend-external"}
+    fe, co = {"name": "frontend"}, {"name": "checkoutservice"}
+    project = "GoogleCloudPlatform/microservices-demo::src/"
+    return {"scan_public_repo": {"source": {"sha": "38e7348"}, "results": [
+        {"repo": project + "emailservice#pip", "verdict": "declared_exposed",
+         "services": [{"name": "emailservice", "exposure_path": [internet, lb, fe, co, {"name": "emailservice"}]}],
+         "vulnerable_paths": [{"path": [project + "emailservice#pip", "requests", "urllib3"]}],
+         "cut_points": {"shared_by_all": [{"package": "requests"}]},
+         "fix_candidates": [{"package": "urllib3", "first_patched": "2.7.0"}]},
+        {"repo": project + "recommendationservice#pip", "verdict": "declared_exposed",
+         "services": [{"name": "recommendationservice", "exposure_path": [internet, lb, fe, {"name": "recommendationservice"}]}],
+         "vulnerable_paths": [{"path": [project + "recommendationservice#pip", "requests", "urllib3"]}],
+         "fix_candidates": [{"package": "urllib3", "first_patched": "2.7.0"}]},
+        {"repo": project + "loadgenerator#pip", "verdict": "declared_internal",
+         "services": [{"name": "loadgenerator", "exposure_path": []}],
+         "vulnerable_paths": [{"path": [project + "loadgenerator#pip", "locust", "geventhttpclient", "urllib3"]}]},
+    ]}}
+
+
+def test_answer_with_real_paths_passes_the_graph_check():
+    answer = ("emailservice is reachable: internet → LoadBalancer → frontend → checkoutservice → emailservice; "
+              "recommendationservice via frontend → recommendationservice. Paths: requests → urllib3, "
+              "locust -> geventhttpclient -> urllib3. Fix urllib3 → 2.7.0.")
+    assert _check_answer(answer, _boutique_evidence()) == []
+
+
+def test_invented_paths_are_rejected():
+    # What gpt-oss actually wrote on 2026-10-17: recommendationservice does not go through checkoutservice,
+    # and loadgenerator has no path from the internet at all.
+    answer = ('Exposure path for recommendationservice: ["internet","LoadBalancer","frontend","checkoutservice",'
+              '"recommendationservice"]. loadgenerator: internet → LoadBalancer → frontend → loadgenerator.')
+    problems = _check_answer(answer, _boutique_evidence())
+    assert len(problems) == 2
+    assert any("checkoutservice → recommendationservice" in p for p in problems)
+    assert any("frontend → loadgenerator" in p for p in problems)
+
+
+def test_grounded_text_states_only_graph_facts():
+    text = _grounded_text("CVE-2026-44432", _boutique_evidence())
+    assert text.startswith("3 of 3 projects are affected by CVE-2026-44432.")
+    assert "emailservice (Internet → LoadBalancer → frontend → checkoutservice → emailservice)" in text
+    assert "Internal only: loadgenerator." in text
+    assert "requests (emailservice)" in text and "urllib3 → 2.7.0" in text
+    assert _check_answer(text, _boutique_evidence()) == []
+
+
+def test_failed_scan_cannot_be_reported_as_clean():
+    evidence = {"graph_blast_radius": {"rows": [{"repo": "o/affected"}]}}
+    text = _grounded_text("CVE-2026-44432", evidence)
+    assert "repository verdict is incomplete" in text
+    assert "No scanned project installs" not in text
+    assert "o/affected" in text

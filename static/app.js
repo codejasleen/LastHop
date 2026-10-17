@@ -27,6 +27,8 @@ const TOOL_DESC = {
   graph_schema: 'Read the graph\'s labels, relationships and loaded repos',
   decision_memory: 'Read team decisions recorded for this project and advisory',
   introducing_commit: 'Traced the commit that introduced the vulnerable pin',
+  answer_check: 'Checked every path in the agent\'s answer against the paths stored in FalkorDB',
+  tool_budget: 'Stopped the agent after its tool-call budget and asked for a final answer',
 };
 const CHOSEN_BY = {
   llm: ['label done', 'chosen by the agent'],
@@ -225,7 +227,7 @@ function renderHeader(entry, scan) {
     (byLang[lang] ||= new Set()).add(parts.filter(p => p !== 'src').pop() || 'repository root');
   }
   const skipped = Object.entries(byLang).map(([lang, names]) => `${[...names].join(', ')} (${lang})`);
-  const coverage = scanned.length ? `<div class="coverage">Scanned: ${esc(scanned.join(', '))}`
+  const coverage = scanned.length ? `<div class="coverage">Dependency files loaded into the graph: ${esc(scanned.join(', '))}`
     + (skipped.length ? ` · <b>Not analyzed (unsupported language):</b> ${esc(skipped.join(' · '))}` : '') + '</div>' : '';
   $('r-labels').innerHTML = labels.join('') + coverage;
 }
@@ -280,12 +282,18 @@ function cutHtml(r) {
     return `<div class="callout"><b>No single cut point:</b> the ${total} paths split early. The most shared package is ${esc(top.package)} (${top.through} of ${total} paths).${query}</div>`;
   }
   const first = all[0];
+  const vulnerable = r.vulnerable_paths?.[0]?.package || 'the vulnerable package';
   const chain = all.map(p => `<code>${esc(p.package)}</code>`).join(' → ');
-  const lead = first.depth === 1
-    ? `${esc(first.package)} is a <b>direct dependency</b> of this project, so it is the one place you control that every path crosses.`
-    : `Every path crosses ${all.length === 1 ? 'this package' : 'these packages'}; a fix there reaches all ${total} paths.`;
-  return `<div class="callout accent-callout"><b>Where to cut:</b> all ${total} of ${total} dependency paths pass through ${chain}. ${lead}${query}</div>`;
+  const how = first.depth === 1
+    ? `${esc(first.package)} is a <b>direct dependency</b> of this project`
+    : `${esc(first.package)} is pulled in ${first.depth} levels deep`;
+  return `<div class="callout accent-callout"><b>Where it enters:</b> all ${total} of ${total} dependency paths pass through ${chain}. ${how}, so it is the single doorway through which ${esc(vulnerable)} reaches this service: the place to look, change and test. The fix itself is the patched ${esc(vulnerable)} version under Fix.${query}</div>`;
 }
+
+const ECOSYSTEM_NAME = {npm: 'npm (JavaScript)', PyPI: 'PyPI (Python)'};
+const advisoryEcosystems = (scan) => [...new Set((scan.advisory.packages || []).map(p => ECOSYSTEM_NAME[p.split(':')[0]] || p.split(':')[0]))].join(' and ') || 'other';
+const skipEcosystem = (skip) => skip.every(x => x.r.repo.includes('#pip')) ? 'they are Python projects'
+  : skip.every(x => !x.r.repo.includes('#pip')) ? 'they are JavaScript (npm) projects' : 'they use a different package manager';
 
 // ---------- overview: checks list ----------
 function exposureLine(r) {
@@ -350,7 +358,7 @@ function checkHtml(r, scan, idx) {
         <div><div class="detail-title">Exposure path · from deployment manifests</div>
           ${svcWithPath ? stepsHtml(svcWithPath)
             : (r.services || []).length ? `<div class="callout success"><b>Internal only:</b> the manifests declare ${(r.services || []).map(s => `<code>${esc(s.name)}</code>`).join(', ')}, and the graph finds no path from the internet to ${(r.services || []).length === 1 ? 'it' : 'them'} (no public route, no caller chain).</div>`
-            : '<div class="callout attention">No deployment evidence for this project, so exposure is unknown. BlastRadius does not guess.</div>'}</div>
+            : '<div class="callout attention">No Kubernetes manifest for this service was found in the deployment folders BlastRadius reads (<code>kubernetes-manifests/</code>, <code>k8s/</code>, <code>kubernetes/</code>, <code>deploy/</code>), so whether the internet can reach it is unknown. The vulnerable package is still installed; BlastRadius does not guess the exposure.</div>'}</div>
       </div>
       ${cutHtml(r)}
       ${moduleHtml(r)}
@@ -403,7 +411,7 @@ function renderOverview(scan) {
   $('c-overview').textContent = rel.length;
   const skipRow = skip.length ? `<div class="check"><div class="check-row static">
       <span class="s-icon s-skip">–</span>
-      <div><div class="check-name">${skip.length} project${skip.length === 1 ? '' : 's'} skipped</div><div class="check-sub">different package ecosystem</div></div>
+      <div><div class="check-name">${skip.length} project${skip.length === 1 ? '' : 's'} not relevant to this advisory</div><div class="check-sub">scanned, but ${esc(skipEcosystem(skip))}; this advisory only affects ${esc(advisoryEcosystems(scan))} packages</div></div>
       <div class="check-why muted">${esc(skip.map(x => projectName(x.r.repo)).join(', '))}</div><span></span><span></span></div></div>` : '';
   $('tab-overview').innerHTML = `<div class="box checks">
     <div class="box-header"><span>${rel.length} project${rel.length === 1 ? '' : 's'} checked · ${bad} reachable from the internet</span>${rel.some(x => x.r.verdict !== 'insufficient_evidence') ? '<span class="muted small">Click a row for its proof</span>' : ''}</div>
@@ -719,10 +727,18 @@ $('decision-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const r = current.data.evidence.scan_public_repo.results[decisionIdx];
   try {
-    await api('/api/decisions', {method: 'POST', body: JSON.stringify({repo: r.repo, advisory: current.data.evidence.scan_public_repo.advisory.id, verdict: $('decision-verdict').value, reason: $('decision-reason').value})});
+    const decision = {verdict: $('decision-verdict').value, reason: $('decision-reason').value};
+    await api('/api/decisions', {method: 'POST', body: JSON.stringify({repo: r.repo, advisory: current.data.evidence.scan_public_repo.advisory.id, ...decision})});
+    // Saved in FalkorDB; show it now. The next investigation reads it back from the graph.
+    r.prior_decisions = [{...decision, created_at: new Date().toISOString(), stale: false}, ...(r.prior_decisions || [])];
+    saveHistory(loadHistory().map(i => i.id === current.id ? current : i));
+    const open = [...document.querySelectorAll('#tab-overview .check.open')].map(c => c.dataset.idx);
+    renderOverview(current.data.evidence.scan_public_repo);
+    renderHistoryTab(current.data.evidence.scan_public_repo);
+    open.forEach(idx => document.querySelector(`#tab-overview .check[data-idx="${idx}"]`)?.classList.add('open'));
     $('decision-modal').classList.add('hidden');
     $('decision-reason').value = '';
-    toast('Decision saved in FalkorDB. Re-run the investigation to see it recalled.');
+    toast('Decision saved to the graph. It is shown below and will be recalled in future investigations.');
   } catch (err) { toast(err.message, true); }
 });
 window.addEventListener('resize', () => cy && cy.resize());

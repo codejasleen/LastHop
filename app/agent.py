@@ -38,7 +38,10 @@ Before each tool call, write one sentence in your message saying why you need it
 Stop calling tools as soon as you can answer. Final answer: 3-6 plain sentences, no markdown.
 - Lead with the verdict: how many projects are affected, naming EVERY affected project with its internet status
   (reachable / internal only / unknown).
-- Copy each exposure path exactly as the tool returned it, every hop included; never shorten a path.
+- Copy each exposure path exactly as the tool returned it, every hop included, written with arrows (a → b → c);
+  never shorten or invent a path. A service with an empty path_from_internet has no path; do not write one.
+- Name services by their short name (emailservice), not the full project id.
+- Each affected service has its own all_paths_enter_through; never apply one service's entry point to another.
 - A cut point is where all dependency paths meet. It tells where the fix lands; it does NOT mean upgrading that
   package removes the vulnerability. The fix is the patched version of the vulnerable package from the scan.
 - Compare with the previous investigation if recall returned one (same commit or not, same counts or not).
@@ -97,7 +100,13 @@ def _compact(name: str, value: Any) -> str:
             "not_analyzed_manifests": src.get("other_manifests"),
             "advisory": {k: value.get("advisory", {}).get(k) for k in ("id", "summary", "severity", "packages")},
             "risk": {k: (value.get("risk_signals") or {}).get(k) for k in ("kev", "epss", "epss_percentile")},
-            "affected": [{"project": r["repo"], "verdict": r["verdict"], "internet": EXPOSURE_WORDS.get(r["verdict"], "unknown"),
+            "affected": [{"service": _token(r["repo"]), "project_id": r["repo"], "verdict": r["verdict"],
+                          "internet": EXPOSURE_WORDS.get(r["verdict"], "unknown"),
+                          # Per-project entry point, so the model never generalises one project's cut point to all.
+                          "all_paths_enter_through": [c["package"] for c in ((r.get("cut_points") or {}).get("shared_by_all") or [])],
+                          # The real exposure path, so the model never has to guess one.
+                          "path_from_internet": next(([_token(n) for n in s["exposure_path"]] for s in r.get("services", [])
+                                                      if s.get("exposure_path")), []),
                           "dependency_id": r["vulnerable_paths"][0]["dependency_id"],
                           "shortest_path": min((p["path"] for p in r["vulnerable_paths"]), key=len)[1:],
                           "installed": f"{r['vulnerable_paths'][0]['package']}@{r['vulnerable_paths'][0]['version']}",
@@ -188,10 +197,12 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
                     message, provider, model = await chat_with_tools(messages, tools)
                     calls = message.get("tool_calls") or []
                     if not calls:
-                        # gpt-oss writes narrow no-break spaces and non-breaking hyphens; keep plain text.
-                        text = (message.get("content") or "").translate({0x202f: " ", 0x00a0: " ", 0x2011: "-", 0x2010: "-"})
-                        text = text.replace("**", "").replace("`", "")  # the UI shows plain text
-                        answer = text.strip() or None
+                        answer = _clean(message.get("content"))
+                        if not answer:
+                            # The model stopped calling tools but wrote nothing: ask once for the answer.
+                            messages.append({"role": "user", "content": "Write the final answer now, using only the tool outputs above."})
+                            message, provider, model = await chat_with_tools(messages, tools, tool_choice="none")
+                            answer = _clean(message.get("content"))
                         break
                     messages.append({"role": "assistant", "content": message.get("content") or "", "tool_calls": calls})
                     reason = _reason(message)
@@ -218,8 +229,7 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
                                   "selected_by": "guard", "reason": "tool budget reached",
                                   "status": "budget_reached", "output": "tool budget reached"})
                     message, provider, model = await chat_with_tools(messages, tools, tool_choice="none")
-                    text = (message.get("content") or "").translate({0x202f: " ", 0x00a0: " ", 0x2011: "-", 0x2010: "-"})
-                    answer = text.replace("**", "").replace("`", "").strip() or None
+                    answer = _clean(message.get("content"))
                 # Guards: the UI and the saved memory need these two pieces of evidence even if the
                 # model skipped them. They are marked as guard steps, not as the model's choice.
                 if root and "scan_public_repo" not in evidence:
@@ -233,14 +243,18 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
         _remember(root, advisory, question, result)
         return result
 
-    scan = evidence.get("scan_public_repo", {})
-    results = scan.get("results", [])
-    affected = [r for r in results if r.get("vulnerable_paths")]
-    if not answer:
-        facts = _facts(advisory, root, evidence)
-        answer, provider = await grounded_summary(question, facts)
-        answer = answer or f"{len(affected)} project(s) have affected package evidence; see the evidence below."
-    output = {"summary": answer, "summary_source": provider, "tool_trace": trace, "evidence": evidence,
+    # The agent chose what to investigate; the answer shown is composed from the graph results it
+    # gathered, so every stated path, entry point and fix is a graph fact. A small model's own prose
+    # kept generalising (one service's entry point applied to all), so it is kept for transparency
+    # and checked, but never shown as the verdict.
+    problems = _check_answer(answer, evidence) if answer else ["the model wrote no final answer"]
+    trace.append({"step": len(trace) + 1, "tool": "answer_check", "arguments": {}, "selected_by": "guard",
+                  "status": "ok" if not problems else "rejected",
+                  "reason": ("Answer written from the graph results the agent gathered. The model's own wording "
+                             + ("also passed the path check." if not problems else f"failed the path check: {problems[0]}.")),
+                  "output": json.dumps({"model_wording": answer, "path_problems": problems})})
+    answer = _grounded_text(advisory, evidence)
+    output = {"summary": answer, "summary_source": f"graph facts · tools chosen by {provider}", "tool_trace": trace, "evidence": evidence,
               "limits": "Package and declared network paths only; function-level reachability and runtime traffic are not measured.",
               "agent": {"mode": "llm", "model": model, "steps": len(trace),
                         "chosen_by_llm": llm_tool_calls}}
@@ -248,16 +262,110 @@ async def investigate(question: str, repo: str | None, advisory: str | None) -> 
     return output
 
 
-def _facts(advisory: str, root: str | None, evidence: dict) -> dict:
-    results = evidence.get("scan_public_repo", {}).get("results", [])
-    affected = [r for r in results if r.get("vulnerable_paths")]
-    return {"advisory": advisory, "affected_projects": len(affected),
-            "other_repos_with_advisory_linked_versions": [r for r in evidence.get("graph_blast_radius", {}).get("repos", []) if r != root],
-            "affected_results": [{"project": r["repo"].split("::")[-1].replace("#pip", ""),
-                                  "internet": EXPOSURE_WORDS.get(r["verdict"], "unknown"),
-                                  "shortest_path": min((p["path"] for p in r["vulnerable_paths"]), key=len),
-                                  "path_count": r.get("vulnerable_path_count", len(r["vulnerable_paths"]))}
-                                 for r in affected[:8]]}
+def _clean(text: str | None) -> str | None:
+    """gpt-oss writes narrow no-break spaces, non-breaking hyphens and markdown; the UI shows plain text."""
+    text = (text or "").translate({0x202f: " ", 0x00a0: " ", 0x2011: "-", 0x2010: "-"})
+    return text.replace("**", "").replace("`", "").strip() or None
+
+
+def _token(value: Any) -> str:
+    """One hop of a path, normalised so 'owner/repo::src/emailservice#pip', 'requests@2.32.5',
+    '"LoadBalancer · frontend-external"' compare equal to the graph's names."""
+    if isinstance(value, dict):
+        value = "internet" if value.get("id") == "internet" else value.get("name") or value.get("kind") or value.get("id")
+    text = str(value).strip().strip("\"'*`[]().,;:").split(" · ")[0].strip()
+    text = text.split("::")[-1].replace("#pip", "").split("@")[0].rstrip("/").split("/")[-1]
+    return text.lower()
+
+
+def _known_chains(evidence: dict) -> list[list[str]]:
+    """Every path the graph actually returned: exposure paths and dependency paths."""
+    chains = []
+    for result in evidence.get("scan_public_repo", {}).get("results", []):
+        for service in result.get("services", []):
+            if service.get("exposure_path"):
+                chains.append([_token(n) for n in service["exposure_path"]])
+        for path in result.get("vulnerable_paths", []):
+            chains.append([_token(n) for n in path.get("path", [])])
+    for context in evidence.get("project_context", {}).values():
+        for service in context.get("exposure_evidence", {}).get("services", []):
+            if service.get("exposure_path"):
+                chains.append([_token(n) for n in service["exposure_path"]])
+    return chains
+
+
+ARROW_CHAIN = re.compile(r"[\w@.\-/:#\"']+(?:\s*(?:→|->)\s*[\w@.\-/:#\"']+)+")
+LIST_CHAIN = re.compile(r"\[([^\[\]]*\"[^\[\]]*)\]")
+
+
+def _check_answer(answer: str, evidence: dict) -> list[str]:
+    """Reject any path the model wrote that is not a contiguous part of a path in the graph."""
+    known = _known_chains(evidence)
+    written = [re.split(r"\s*(?:→|->)\s*", m) for m in ARROW_CHAIN.findall(answer)]
+    written += [m.split(",") for m in LIST_CHAIN.findall(answer)]
+    problems = []
+    for chain in written:
+        # Version-only hops ("urllib3 → 2.7.0") describe a fix, not a path.
+        hops = [_token(h) for h in chain if _token(h) and not re.fullmatch(r"v?\d+(\.\d+)*", _token(h))]
+        if len(hops) < 2:
+            continue
+        if not any(hops == path[i:i + len(hops)] for path in known for i in range(len(path) - len(hops) + 1)):
+            problems.append(f"it stated the path {' → '.join(hops)}, which is not in the graph")
+    return problems
+
+
+def _grounded_text(advisory: str, evidence: dict) -> str:
+    """The answer written straight from the graph: used when the model's answer fails the check."""
+    scan = evidence.get("scan_public_repo") or {}
+    results = scan.get("results") or []
+    relevant = [r for r in results if r.get("verdict") != "not_applicable"]
+    affected = [r for r in relevant if r.get("vulnerable_paths")]
+    name = lambda r: _token(r["repo"])
+    if not results:
+        text = f"No repository scan results are available for {advisory}; the repository verdict is incomplete."
+    elif not relevant:
+        text = f"The {len(results)} scanned project(s) use an ecosystem outside this advisory; no affected ecosystem was checked."
+    elif not affected:
+        text = f"No scanned project installs a version affected by {advisory} ({len(relevant)} relevant project(s) checked)."
+    else:
+        text = f"{len(affected)} of {len(relevant)} projects are affected by {advisory}."
+        reachable = []
+        for r in affected:
+            path = next((s["exposure_path"] for s in r.get("services", []) if s.get("exposure_path")), None)
+            if path and r["verdict"] in ("affected_exposed", "declared_exposed"):
+                shown = ["Internet" if n.get("id") == "internet" else n.get("name") or n.get("kind") or n.get("id") for n in path]
+                reachable.append(f"{name(r)} ({' → '.join(shown)})")
+        if reachable:
+            text += " Reachable from the internet: " + "; ".join(reachable) + "."
+        internal = [name(r) for r in affected if r["verdict"] in ("affected_internal_declared", "declared_internal")]
+        unknown = [name(r) for r in affected if "exposure_unknown" in r["verdict"]]
+        if internal:
+            text += f" Internal only: {', '.join(internal)}."
+        if unknown:
+            text += f" Exposure unknown (no deployment manifest found): {', '.join(unknown)}."
+        entries = {}
+        for r in affected:
+            shared = ((r.get("cut_points") or {}).get("shared_by_all") or [])
+            if shared:
+                entries.setdefault(shared[0]["package"], []).append(name(r))
+        if entries:
+            text += " Every vulnerable path enters through " + "; ".join(
+                f"{pkg} ({', '.join(names)})" for pkg, names in entries.items()) + "."
+        fixes = {f"{f['package']} → {f.get('target') or f.get('first_patched')}" for r in affected
+                 for f in r.get("fix_candidates", []) if f.get("target") or f.get("first_patched")}
+        if fixes:
+            text += f" Fix: {', '.join(sorted(fixes))}."
+    root = evidence.get("scan_public_repo", {}).get("source", {}).get("repo")
+    others = sorted({row["repo"] for row in evidence.get("graph_blast_radius", {}).get("rows", []) if row.get("repo") != root})
+    if others:
+        text += f" The same vulnerable version is also installed in other repos in the graph: {', '.join(others)}."
+    previous = evidence.get("recall_investigations", {}).get("previous", [])
+    if previous:
+        last = previous[0]
+        text += (f" The previous investigation ({str(last.get('created_at', ''))[:10]}) found {last.get('affected')} affected and "
+                 f"{last.get('reachable')} reachable" + (" at the same commit." if last.get("sha") == evidence.get(
+                     "scan_public_repo", {}).get("source", {}).get("sha") else " at an older commit."))
+    return text
 
 
 def _remember(root: str | None, advisory: str, question: str, output: dict) -> str | None:

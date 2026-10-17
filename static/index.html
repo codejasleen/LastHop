@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0d1117">
   <title>BlastRadius</title>
-  <link rel="stylesheet" href="/static/styles.css?v=11">
+  <link rel="stylesheet" href="/static/styles.css?v=16">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js" defer></script>
 </head>
 <body>
@@ -86,7 +86,6 @@
           <button class="tab active" data-tab="overview" role="tab">Overview <span class="counter" id="c-overview"></span></button>
           <button class="tab" data-tab="graph" role="tab">Blast radius</button>
           <button class="tab" data-tab="agent" role="tab">Agent run <span class="counter" id="c-agent"></span></button>
-          <button class="tab" data-tab="files" role="tab">Files changed <span class="counter" id="c-files"></span></button>
           <button class="tab" data-tab="history" role="tab">History</button>
         </nav>
 
@@ -101,12 +100,28 @@
           <div id="graph-query"></div>
         </div>
         <div class="tab-panel hidden" id="tab-agent"></div>
-        <div class="tab-panel hidden" id="tab-files"></div>
         <div class="tab-panel hidden" id="tab-history"></div>
       </section>
     </main>
   </div>
 
+  <div id="issue-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="issue-modal-title">
+    <form id="issue-form" class="modal wide">
+      <div class="modal-head"><h2 id="issue-modal-title">Raise a GitHub issue</h2><button class="btn-icon" id="close-issue" type="button" aria-label="Close">✕</button></div>
+      <p class="muted small" id="issue-target"></p>
+      <div id="issue-existing"></div>
+      <label for="issue-title">Title</label>
+      <input id="issue-title" required minlength="5" maxlength="256">
+      <label for="issue-body">Description <span class="optional">drafted by BlastRadius from the graph; edit freely</span></label>
+      <textarea id="issue-body" class="mono" rows="18" required></textarea>
+      <label for="issue-key">Approval key</label>
+      <div class="modal-foot spread">
+        <input id="issue-key" type="password" placeholder="BLASTRADIUS_ADMIN_KEY" autocomplete="off">
+        <button class="btn btn-primary" id="issue-submit" type="submit">Create issue</button>
+      </div>
+      <p class="hint">Nothing is filed until you click Create issue. The server's GitHub token needs Issues: Read and write on this repository.</p>
+    </form>
+  </div>
   <div id="decision-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="decision-title">
     <form id="decision-form" class="modal">
       <div class="modal-head"><h2 id="decision-title">Record a decision</h2><button class="btn-icon" id="close-decision" type="button" aria-label="Close">✕</button></div>
@@ -119,6 +134,6 @@
     </form>
   </div>
   <div id="toast" class="toast hidden" role="status"></div>
-  <script src="/static/app.js?v=11"></script>
+  <script src="/static/app.js?v=16"></script>
 </body>
 </html>

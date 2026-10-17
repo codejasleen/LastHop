@@ -429,6 +429,26 @@ class GraphStore:
         keys = ["created_at", "advisory", "question", "answer", "sha", "affected", "reachable", "tools", "mode"]
         return [dict(zip(keys, row)) for row in rows]
 
+    def save_issue_report(self, project: str, advisory_id: str, issue: dict[str, Any], title: str) -> None:
+        """Remember filed issues so the next investigation shows them instead of filing duplicates.
+        No repo_id: re-scanning the repo must not erase it."""
+        self.graph.query(
+            "CREATE (i:IssueReport {url:$url, number:$number, title:$title, project:$project, advisory:$advisory, "
+            "created_at:$now})",
+            {"url": issue["url"], "number": issue["number"], "title": title, "project": project,
+             "advisory": advisory_id, "now": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        self.graph.query("MATCH (i:IssueReport {url:$url}), (a:Advisory {id:$advisory}) MERGE (i)-[:ABOUT]->(a)",
+                         {"url": issue["url"], "advisory": advisory_id})
+        self.graph.query("MATCH (i:IssueReport {url:$url}), (r:Repo {id:$project}) MERGE (r)-[:HAS_ISSUE]->(i)",
+                         {"url": issue["url"], "project": project})
+
+    def issue_reports(self, project: str, advisory_id: str) -> list[dict[str, Any]]:
+        rows = self.graph.ro_query(
+            "MATCH (i:IssueReport {project:$project, advisory:$advisory}) "
+            "RETURN i.url, i.number, i.title, i.created_at ORDER BY i.created_at DESC LIMIT 5",
+            {"project": project, "advisory": advisory_id}, timeout=3000).result_set
+        return [dict(zip(["url", "number", "title", "created_at"], row)) for row in rows]
+
     def save_decision(self, repo: str, advisory_id: str, verdict: str, reason: str) -> None:
         repo_rows = self.graph.ro_query("MATCH (r:Repo {id:$repo}) RETURN r.sha LIMIT 1", {"repo": repo}, timeout=3000).result_set
         if not repo_rows:

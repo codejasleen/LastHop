@@ -83,7 +83,12 @@ function uniqueFixes(result) {
     seen.add(k); return true;
   });
 }
-const fixable = (r) => r.fix_supported && uniqueFixes(r).find(f => f.strategy === 'lockfile_refresh');
+// Verified fixes (the patched version provably fits); the issue draft uses them.
+const AUTO_FIX = ['lockfile_refresh', 'requirements_pin'];
+const fixable = (r) => r.fix_supported && uniqueFixes(r).find(f => AUTO_FIX.includes(f.strategy));
+const fixCheck = (f) => f.strategy === 'requirements_pin'
+  ? (f.parents_checked?.length ? `checked: ${f.parents_checked.join('; ')}` : 'pinned directly; no other package constrains it')
+  : `fits ${f.parent_name}'s declared range ${f.declared_range}`;
 
 // ---------- history (per-browser convenience only) ----------
 function loadHistory() {
@@ -183,7 +188,6 @@ function openInvestigation(entry) {
   renderVerdict(entry, scan);
   renderOverview(scan);
   renderAgent(entry);
-  renderFiles(scan);
   renderHistoryTab(scan);
   selectTab('overview');
   show('result');
@@ -253,7 +257,7 @@ function renderVerdict(entry, scan) {
   const lines = [];
   if (exposed.length) lines.push(`Reachable: ${exposed.map(r => projectName(r.repo)).join(', ')}`);
   if (unknown) lines.push(`${unknown} with no deployment evidence (exposure unknown)`);
-  if (affected.length) lines.push(fixes ? `Fix candidate for ${fixes} project${fixes === 1 ? '' : 's'}, verified in Files changed` : 'No automatic fix: manual review');
+  if (affected.length) lines.push(fixes ? `Verified fix for ${fixes} project${fixes === 1 ? '' : 's'}; raise an issue from each row` : 'Fix needs manual review; raise an issue from each row');
   if (skipped) lines.push(`${skipped} project${skipped === 1 ? '' : 's'} in another ecosystem skipped`);
   const others = otherRepoRows(entry);
   if (others.length) lines.push(`Advisory-linked affected packages also appear in ${[...new Set(others.map(o => o.repo))].join(', ')} (graph)`);
@@ -340,8 +344,8 @@ function checkHtml(r, scan, idx) {
   const vp = paths[0];
   const total = r.vulnerable_path_count ?? paths.length;
   const fixes = uniqueFixes(r);
-  const fixText = fixes.length ? fixes.map(f => f.strategy === 'lockfile_refresh'
-    ? `${esc(f.package)} ${esc(f.before || '')} → ${esc(f.target)} <span class="muted">(fits ${esc(f.parent_name)} ${esc(f.declared_range)})</span>`
+  const fixText = fixes.length ? fixes.map(f => AUTO_FIX.includes(f.strategy)
+    ? `${esc(f.package)} ${esc(f.before || '')} → ${esc(f.target)} <span class="muted">(${esc(fixCheck(f))})</span>`
     : `${esc(f.package)} → ${esc(f.first_patched)} <span class="muted">· manual review${f.reason ? `: ${esc(f.reason)}` : ''}</span>`).join('<br>') : '<span class="muted">No patched version in the advisory</span>';
   const why = affected
     ? `${exposureLine(r)}<div class="muted">${esc(vp.package)} ${esc(vp.version)} · ${vp.path.length - 1} hop${vp.path.length === 2 ? '' : 's'} · ${total} path${total === 1 ? '' : 's'}${fixes[0] ? ` · fix → ${esc(fixes[0].target || fixes[0].first_patched)}` : ''}</div>`
@@ -369,10 +373,11 @@ function checkHtml(r, scan, idx) {
         <dt>Last decision</dt><dd>${decision ? `<b>${esc(decision.verdict)}</b> · ${esc(decision.reason)} ${decision.stale ? '<span class="label attention">re-review: repository changed</span>' : ''}` : '<span class="muted">none recorded</span>'}</dd>
       </dl>
       <div class="row-actions">
-        ${fixable(r) ? `<button class="btn btn-sm btn-primary" data-goto-fix="${idx}" type="button">Review fix</button>` : ''}
+        <button class="btn btn-sm btn-primary" data-issue="${idx}" type="button">Raise GitHub issue</button>
         <button class="btn btn-sm" data-decision="${idx}" type="button">Record decision</button>
         ${r.provenance_supported ? `<button class="btn btn-sm" data-provenance="${idx}" type="button">Who introduced it?</button>` : ''}
       </div>
+      ${(r.issues || []).length ? `<p class="small" style="margin:8px 0 0">Issue already filed: ${r.issues.map(i => `<a href="${esc(i.url)}" target="_blank" rel="noopener noreferrer">#${esc(i.number)}</a>`).join(', ')}</p>` : ''}
       <div class="prov" id="prov-${idx}"></div>
     </div>`;
   return `<div class="check" data-idx="${idx}">
@@ -595,64 +600,30 @@ function renderAgent(entry) {
   </ol>`;
 }
 
-// ---------- files changed ----------
-function renderFiles(scan) {
-  const affected = scan.results.map((r, idx) => ({r, idx})).filter(x => x.r.vulnerable_paths?.length);
-  const ready = affected.filter(x => fixable(x.r));
-  const manual = affected.filter(x => !fixable(x.r));
-  $('c-files').textContent = ready.length || '';
-  $('tab-files').innerHTML = (ready.map(({r, idx}) => {
-    const f = fixable(r);
-    return `<div class="box file" id="file-${idx}">
-      <div class="box-header"><span>${esc(r.repo.includes('::') ? r.repo.split('::')[1] : '.')}/package-lock.json · ${esc(f.package)} ${esc(f.before || '')} → ${esc(f.target)}</span>
-        <button class="btn btn-sm" data-load-diff="${idx}" type="button">Load diff</button></div>
-      <div class="file-body muted">Candidate: ${esc(f.target)} fits ${esc(f.parent_name)}'s declared range <code>${esc(f.declared_range)}</code>. Loading the diff verifies the patched package against the registry before anything can be approved.</div>
-      <div class="diff-wrap"></div></div>`;
-  }).join('') || '<div class="box"><div class="box-row muted">No automatic fixes for this advisory.</div></div>')
-  + (manual.length ? `<div class="box" style="margin-top:16px"><div class="box-header"><span>Needs manual review</span></div>${manual.map(({r}) =>
-      `<div class="box-row"><b>${esc(projectName(r.repo))}</b> <span class="muted">· ${esc(uniqueFixes(r).map(f => `${f.package} → ${f.first_patched || '?'}`).join(', ') || 'no patched version published')}${r.fix_supported ? '' : ' · nested or non-npm project'}</span></div>`).join('')}</div>` : '');
-}
-
-function diffHtml(text) {
-  return `<div class="diff">${text.split('\n').map(l => {
-    const cls = l.startsWith('+') && !l.startsWith('+++') ? 'add' : l.startsWith('-') && !l.startsWith('---') ? 'del' : l.startsWith('@@') ? 'hunk' : '';
-    return `<div class="${cls}">${esc(l) || ' '}</div>`;
-  }).join('')}</div>`;
-}
-
-async function loadDiff(idx, button) {
-  const r = current.data.evidence.scan_public_repo.results[idx];
-  const f = fixable(r);
-  const box = $(`file-${idx}`).querySelector('.diff-wrap');
-  button.disabled = true; button.textContent = 'Preparing…';
-  try {
-    const p = await api('/api/fixes/preview', {method: 'POST', body: JSON.stringify({repo: r.repo, advisory: current.data.evidence.scan_public_repo.advisory.id, package: f.package})});
-    box.innerHTML = diffHtml(p.diff + (p.truncated ? '\n… display truncated; the full change will be committed' : ''))
-      + `<div class="approve-row"><input type="password" placeholder="Approval key (BLASTRADIUS_ADMIN_KEY)" autocomplete="off">
-         <button class="btn btn-primary" type="button" data-approve="${esc(p.proposal_id)}">Create draft PR</button>
-         <span class="hint">Creates a branch and a draft PR. Never merges. Needs a GitHub token with write access.</span></div>`;
-    button.textContent = 'Diff loaded';
-  } catch (err) {
-    const dir = r.repo.includes('::') ? r.repo.split('::')[1] : '.';
-    box.innerHTML = `<div class="file-body"><div class="callout attention" style="margin:0"><b>Automatic fix refused:</b> ${esc(err.message)}.
-      <br>Safe next step: in <code>${esc(dir)}</code> run <code>npm update ${esc(f.package)}</code>, then review the npm-generated lockfile change by hand.</div></div>`;
-    button.textContent = 'Manual review';
-  }
-}
-
 // ---------- history tab ----------
+/* Read-only memory: what the team decided, and what the agent concluded before. Actions live in Overview. */
 function renderHistoryTab(scan) {
-  const affected = scan.results.map((r, idx) => ({r, idx})).filter(x => x.r.vulnerable_paths?.length);
-  if (!affected.length) { $('tab-history').innerHTML = '<div class="box"><div class="box-row muted">Nothing affected, so nothing to decide.</div></div>'; return; }
-  $('tab-history').innerHTML = affected.map(({r, idx}) => `<div class="box" style="margin-bottom:16px">
-    <div class="box-header"><span>${esc(projectName(r.repo))}</span><span>
-      <button class="btn btn-sm" data-decision="${idx}" type="button">Record decision</button>
-      ${r.provenance_supported ? `<button class="btn btn-sm" data-provenance="${idx}" data-target="hprov-${idx}" type="button">Who introduced it?</button>` : ''}</span></div>
-    <div class="box-row">${(r.prior_decisions || []).length ? `<ol class="timeline">${r.prior_decisions.map(d => `<li class="tl-item"><div class="tl-badge">✎</div><div class="tl-body">
-        <div class="tl-title"><b>${esc(d.verdict)}</b> ${d.stale ? '<span class="label attention">re-review: repository changed</span>' : '<span class="label success">current commit</span>'}</div>
-        <div class="tl-sub">${esc(d.reason)} · ${esc(d.created_at ? new Date(d.created_at).toLocaleString() : '')}</div></div></li>`).join('')}</ol>`
-      : '<span class="muted">No decisions recorded for this advisory yet. Decisions are stored in FalkorDB and recalled on the next investigation.</span>'}
-      <div class="prov" id="hprov-${idx}"></div></div></div>`).join('');
+  const VERDICT_WORDS = {investigate: 'Investigate further', accepted_risk: 'Risk accepted', remediated: 'Remediated'};
+  const when = (iso) => iso ? new Date(iso).toLocaleString() : '';
+  const decided = scan.results.filter(r => (r.prior_decisions || []).length);
+  const decisions = decided.length ? `<ol class="timeline">${decided.flatMap(r => r.prior_decisions.map(d => `<li class="tl-item"><div class="tl-badge">✎</div><div class="tl-body">
+      <div class="tl-title"><b>${esc(projectName(r.repo))}</b> · ${esc(VERDICT_WORDS[d.verdict] || d.verdict)}
+        ${d.stale ? '<span class="label attention">made on an older commit: re-review</span>' : '<span class="label success">current commit</span>'}</div>
+      <div class="tl-sub">“${esc(d.reason)}” · ${esc(when(d.created_at))}</div></div></li>`)).join('')}</ol>`
+    : '<div class="box-row muted">No team decisions recorded for this advisory yet. Record one from a row in Overview; it is stored in FalkorDB and shown here.</div>';
+  const previous = current?.data.evidence.recall_investigations?.previous || [];
+  const runs = previous.length ? `<ol class="timeline">${previous.map(p => `<li class="tl-item"><div class="tl-badge agent">◎</div><div class="tl-body">
+      <div class="tl-title"><b>${esc(p.advisory)}</b> · ${esc(p.affected)} affected, ${esc(p.reachable)} reachable · commit <code>${esc((p.sha || '').slice(0, 7))}</code></div>
+      <div class="tl-sub">${esc(when(p.created_at))} · ${esc(String(p.answer || '').slice(0, 220))}${String(p.answer || '').length > 220 ? '…' : ''}</div></div></li>`).join('')}</ol>`
+    : '<div class="box-row muted">This was the agent\'s first investigation of this repo. It is now saved in the graph and will be recalled next time.</div>';
+  const filed = scan.results.flatMap(r => (r.issues || []).map(i => ({...i, service: projectName(r.repo)})));
+  const issues = filed.length ? `<ol class="timeline">${filed.map(i => `<li class="tl-item"><div class="tl-badge ok">!</div><div class="tl-body">
+      <div class="tl-title"><a href="${esc(i.url)}" target="_blank" rel="noopener noreferrer">#${esc(i.number)}</a> · <b>${esc(i.service)}</b> · ${esc(i.title || '')}</div>
+      <div class="tl-sub">${esc(when(i.created_at))}</div></div></li>`).join('')}</ol>`
+    : '<div class="box-row muted">No GitHub issue filed for this advisory yet. Raise one from an affected row in Overview.</div>';
+  $('tab-history').innerHTML = `<div class="box" style="margin-bottom:16px"><div class="box-header"><span>GitHub issues filed</span></div><div class="box-row">${issues}</div></div>
+    <div class="box" style="margin-bottom:16px"><div class="box-header"><span>Team decisions</span></div><div class="box-row">${decisions}</div></div>
+    <div class="box"><div class="box-header"><span>Earlier agent investigations of this repo (memory)</span></div><div class="box-row">${runs}</div></div>`;
 }
 
 async function provenance(idx, button) {
@@ -673,8 +644,7 @@ const TAB_INTRO = {
   overview: 'One row per scanned project: ✕ affected and reachable from the internet, ! affected but not proven reachable, ✓ not affected. Open a row to see its evidence.',
   graph: 'How the internet reaches each affected service, and how the vulnerable package reaches that service, drawn from FalkorDB. Below it, the single Cypher query that computes the blast radius across every repo in the graph.',
   agent: 'What the agent decided: each MCP tool it chose, why, and exactly what that tool returned from the graph, then its answer. The answer may only use facts from these outputs.',
-  files: 'Proposed fixes as lockfile diffs. Nothing changes until a person enters the approval key; then a draft pull request is opened, never merged.',
-  history: 'Decisions your team recorded for this advisory (stored in FalkorDB and recalled on the next investigation), and which commit introduced the vulnerable version.',
+  history: 'Memory from the graph: GitHub issues filed, decisions your team recorded for this advisory, and what the agent concluded in earlier investigations of this repo.',
 };
 
 function selectTab(name) {
@@ -686,13 +656,13 @@ function selectTab(name) {
 
 let decisionIdx = null;
 document.addEventListener('click', async (e) => {
-  const t = e.target.closest('[data-tab],[data-toggle],[data-history],[data-repo],[data-goto-fix],[data-decision],[data-provenance],[data-load-diff],[data-approve]');
+  const t = e.target.closest('[data-tab],[data-toggle],[data-history],[data-repo],[data-decision],[data-provenance],[data-issue]');
   if (!t) return;
+  if (t.dataset.issue) return openIssueDraft(Number(t.dataset.issue), t);
   if (t.dataset.tab) return selectTab(t.dataset.tab);
   if (t.hasAttribute('data-toggle')) return t.parentElement.classList.toggle('open');
   if (t.dataset.history) { const entry = loadHistory().find(i => i.id === t.dataset.history); if (entry) openInvestigation(entry); return; }
   if (t.dataset.repo) return newInvestigation(t.dataset.repo);
-  if (t.dataset.gotoFix) { selectTab('files'); const b = document.querySelector(`[data-load-diff="${t.dataset.gotoFix}"]`); b?.scrollIntoView({block: 'center'}); if (b && !b.disabled) loadDiff(t.dataset.gotoFix, b); return; }
   if (t.dataset.decision) {
     decisionIdx = Number(t.dataset.decision);
     const r = current.data.evidence.scan_public_repo.results[decisionIdx];
@@ -702,15 +672,6 @@ document.addEventListener('click', async (e) => {
     return;
   }
   if (t.dataset.provenance) return provenance(Number(t.dataset.provenance), t);
-  if (t.dataset.loadDiff) return loadDiff(Number(t.dataset.loadDiff), t);
-  if (t.dataset.approve) {
-    const key = t.parentElement.querySelector('input').value;
-    t.disabled = true; t.textContent = 'Creating draft PR…';
-    try {
-      const res = await api('/api/fixes/approve', {method: 'POST', body: JSON.stringify({proposal_id: t.dataset.approve, admin_key: key})});
-      t.parentElement.innerHTML = `<span class="label success">Draft PR created</span> <a href="${esc(res.pull_request_url)}" target="_blank" rel="noopener noreferrer">${esc(res.pull_request_url)}</a>`;
-    } catch (err) { toast(err.message, true); t.disabled = false; t.textContent = 'Create draft PR'; }
-  }
 });
 
 $('form').addEventListener('submit', (e) => { e.preventDefault(); investigate($('f-repo').value.trim(), $('f-adv').value.trim(), $('f-q').value.trim()); });
@@ -740,6 +701,46 @@ $('decision-form').addEventListener('submit', async (e) => {
     $('decision-reason').value = '';
     toast('Decision saved to the graph. It is shown below and will be recalled in future investigations.');
   } catch (err) { toast(err.message, true); }
+});
+// ---------- GitHub issue: drafted by BlastRadius, edited and approved by a person ----------
+let issueIdx = null;
+async function openIssueDraft(idx, button) {
+  const scan = current.data.evidence.scan_public_repo;
+  const r = scan.results[idx];
+  issueIdx = idx;
+  button.disabled = true; button.textContent = 'Drafting…';
+  try {
+    const d = await api('/api/issues/draft', {method: 'POST', body: JSON.stringify({repo: r.repo, advisory: scan.advisory.id, fix: fixable(r) || uniqueFixes(r)[0] || null})});
+    $('issue-target').textContent = `Will be filed in ${d.target_repo} for ${projectName(r.repo)}. Edit anything below; nothing is filed until you approve.`;
+    $('issue-existing').innerHTML = (d.existing || []).length
+      ? `<div class="callout attention" style="margin:8px 0">An issue for this was already filed: ${d.existing.map(i => `<a href="${esc(i.url)}" target="_blank" rel="noopener noreferrer">#${esc(i.number)}</a>`).join(', ')}. Check it before filing another.</div>` : '';
+    $('issue-title').value = d.title;
+    $('issue-body').value = d.body;
+    $('issue-modal').classList.remove('hidden');
+    $('issue-title').focus();
+  } catch (err) { toast(err.message, true); }
+  finally { button.disabled = false; button.textContent = 'Raise GitHub issue'; }
+}
+$('close-issue').addEventListener('click', () => $('issue-modal').classList.add('hidden'));
+$('issue-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const scan = current.data.evidence.scan_public_repo;
+  const r = scan.results[issueIdx];
+  const submit = $('issue-submit');
+  submit.disabled = true; submit.textContent = 'Filing…';
+  try {
+    const issue = await api('/api/issues/create', {method: 'POST', body: JSON.stringify({repo: r.repo, advisory: scan.advisory.id,
+      title: $('issue-title').value, body: $('issue-body').value, admin_key: $('issue-key').value})});
+    $('issue-key').value = '';
+    $('issue-modal').classList.add('hidden');
+    r.issues = [{...issue, title: $('issue-title').value, created_at: new Date().toISOString()}, ...(r.issues || [])];
+    saveHistory(loadHistory().map(i => i.id === current.id ? current : i));
+    renderOverview(scan);
+    renderHistoryTab(scan);
+    toast(`Issue #${issue.number} filed and remembered in the graph.`);
+    window.open(issue.url, '_blank', 'noopener');
+  } catch (err) { toast(err.message, true); }
+  finally { submit.disabled = false; submit.textContent = 'Create issue'; }
 });
 window.addEventListener('resize', () => cy && cy.resize());
 

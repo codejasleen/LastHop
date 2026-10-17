@@ -14,10 +14,10 @@ from pydantic import BaseModel, Field
 
 from .advisories import Advisory, fetch_advisory, is_affected
 from .graph import GraphStore, dependency_graph
-from .fixes import build_preview, create_draft_pr, lockfile_refresh_plan
+from .fixes import lockfile_refresh_plan, requirements_pin_plan
 from .module_trace import fetch_parent_trace
 from .risk_signals import assign_priority, fetch_risk_signals
-from .sources import SourceAcquisitionError, fetch_public_projects, fetch_public_repo
+from .sources import SourceAcquisitionError, fetch_public_projects
 from .webhooks import verify_push
 
 
@@ -45,17 +45,6 @@ class DecisionRequest(BaseModel):
     advisory: str
     verdict: str = Field(pattern="^(investigate|accepted_risk|remediated)$")
     reason: str = Field(min_length=4, max_length=500)
-
-
-class PreviewRequest(BaseModel):
-    repo: str
-    advisory: str
-    package: str
-
-
-class ApproveRequest(BaseModel):
-    proposal_id: str
-    admin_key: str
 
 
 class AgentRequest(BaseModel):
@@ -246,9 +235,18 @@ def investigate_one(graph: GraphStore, repo: str, advisory: Advisory) -> dict:
         "services": context["services"],
         "prior_decisions": context["decisions"],
         "fix_candidates": fix_candidates,
-        "fix_supported": context.get("manager", "npm") == "npm",
+        "fix_supported": context.get("manager", "npm") in ("npm", "pip"),
+        "issues": _filed_issues(graph, repo, advisory.identifier) if vulnerable_paths else [],
         "provenance_supported": context.get("manager", "npm") == "npm",
     }
+
+
+def _filed_issues(graph: GraphStore, repo: str, advisory_id: str) -> list[dict]:
+    """Issues already filed for this finding. Best-effort: never costs the verdict."""
+    try:
+        return graph.issue_reports(repo, advisory_id)
+    except Exception:
+        return []
 
 
 async def enrich_live_result(graph: GraphStore, snapshot, advisory: Advisory, result: dict) -> None:
@@ -260,6 +258,15 @@ async def enrich_live_result(graph: GraphStore, snapshot, advisory: Advisory, re
             result["cut_points"] = graph.cut_points(snapshot.repo, result["vulnerable_paths"][0]["dependency_id"])
         except Exception:  # a timeout here must not cost the verdict itself
             result["cut_points"] = None
+    if snapshot.manager == "pip" and result["vulnerable_paths"]:
+        # Check up front whether a one-line pin change is provably safe for the issue draft.
+        for candidate in result["fix_candidates"]:
+            try:
+                candidate.update(await requirements_pin_plan(snapshot, advisory, candidate["package"]), reason=None)
+            except (ValueError, httpx.HTTPError) as exc:
+                candidate["strategy"] = "manual_review"
+                candidate["reason"] = str(exc)
+        return
     if snapshot.manager != "npm" or not result["vulnerable_paths"]:
         return
     dependencies, edges = dependency_graph(snapshot)
@@ -393,46 +400,48 @@ def save_decision(request: DecisionRequest) -> dict:
         raise HTTPException(404, str(exc)) from exc
 
 
-@app.post("/api/fixes/preview")
-async def preview_fix(request: PreviewRequest) -> dict:
+class IssueDraftRequest(BaseModel):
+    repo: str
+    advisory: str
+    fix: dict | None = None
+
+
+class IssueCreateRequest(BaseModel):
+    repo: str
+    advisory: str
+    title: str = Field(min_length=5, max_length=256)
+    body: str = Field(min_length=20, max_length=60000)
+    admin_key: str
+
+
+@app.post("/api/issues/draft")
+async def draft_github_issue(request: IssueDraftRequest) -> dict:
+    """BlastRadius writes the issue from the graph; the person edits it before approving."""
+    from .issues import draft_issue
+    from .risk_signals import fetch_risk_signals
+
     try:
         graph = store()
-        repo_record = next((r for r in graph.repositories() if r["repo"] == request.repo), None)
-        if repo_record is None:
-            raise HTTPException(404, "Repository is not in the graph")
         advisory = await fetch_advisory(request.advisory)
-        paths = graph.paths_to(request.repo, request.package)
-        affected = [
-            path for path in paths
-            if any(
-                p.name == request.package and is_affected(path["version"], p.vulnerable_range) is True
-                for p in advisory.packages
-            )
-        ]
-        if not affected:
-            raise ValueError("No affected dependency path supports an automated fix")
-        snapshot = next((s for s in await fetch_public_projects(request.repo.split("::")[0]) if s.repo == request.repo), None)
-        if snapshot is None:
-            raise ValueError("Project is no longer present at the latest commit")
-        if snapshot.sha != repo_record["sha"]:
-            raise ValueError("Repository changed since ingestion; import it again before proposing a fix")
-        _, preview = await build_preview(snapshot, advisory, request.package, [node.get("name") or node.get("id") for node in affected[0]["nodes"]])
-        return preview
-    except HTTPException:
-        raise
+        draft = draft_issue(graph, request.repo, advisory, await fetch_risk_signals(advisory.identifier), request.fix)
+        return {**draft, "target_repo": request.repo.split("::")[0],
+                "existing": graph.issue_reports(request.repo, advisory.identifier)}
     except (ValueError, LookupError) as exc:
         raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(502, f"Fix preview failed: {exc.__class__.__name__}: {exc}") from exc
 
 
-@app.post("/api/fixes/approve")
-async def approve_fix(request: ApproveRequest) -> dict:
+@app.post("/api/issues/create")
+async def create_github_issue(request: IssueCreateRequest) -> dict:
+    """Files the (edited) issue only with the approval key, then remembers it in the graph."""
+    from .issues import create_issue
+
     try:
-        return {"pull_request_url": await create_draft_pr(request.proposal_id, request.admin_key)}
+        issue = await create_issue(request.repo.split("::")[0], request.title, request.body, request.admin_key)
+        store().save_issue_report(request.repo, request.advisory.upper(), issue, request.title)
+        return issue
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(502, f"Draft PR failed: {exc.__class__.__name__}: {exc}") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"GitHub rejected the issue: {exc}") from exc

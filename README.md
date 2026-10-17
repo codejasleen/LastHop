@@ -17,7 +17,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Open <http://127.0.0.1:8000>. The FalkorDB Browser is at <http://127.0.0.1:3000>. **Try real example** scans Online Boutique. A public repo needs no sign-in. `GITHUB_TOKEN` is optional for higher API limits and required, with write permission to the target repo, for draft PR creation. When anonymous API quota is exhausted, source ingestion tries a bounded GitHub archive, then a shallow filtered Git checkout if the archive is unavailable.
+Open <http://127.0.0.1:8000>. The FalkorDB Browser is at <http://127.0.0.1:3000>. **Try real example** scans Online Boutique. A public repo needs no sign-in. `GITHUB_TOKEN` is optional for higher API limits; creating a GitHub issue requires a token with Issues write permission for the target repo and a server-side `BLASTRADIUS_ADMIN_KEY`. When anonymous API quota is exhausted, source ingestion tries a bounded GitHub archive, then a shallow filtered Git checkout if the archive is unavailable.
 
 For optional Groq summaries, set `GROQ_API_KEY` in a local `.env` file (see `.env.example`). The app reads it when an agent summary runs, and Git ignores the file.
 
@@ -92,9 +92,11 @@ For CVEs, BlastRadius fetches the current [CISA KEV catalog](https://www.cisa.go
 
 **Trace introducing commit** checks which lockfile commit changed the exact installed package key to its current vulnerable version. It uses GitHub's commit, associated PR, and review APIs. If anonymous API quota is exhausted, bounded shallow public Git history can verify the commit; a PR number parsed from its title is labeled inferred and reviewers remain unknown. `Commit`, `PullRequest`, and anonymous role-only `Person` nodes preserve graph relationships without storing author or reviewer names in FalkorDB. Public names are shown transiently from source evidence when available.
 
-For npm direct or transitive dependencies in root or nested projects, BlastRadius checks whether the first patched version fits the immediate parent's declared range. If it fits and package dependency metadata is unchanged, it builds a targeted lockfile diff using verified npm registry metadata. A human reviews the diff and enters `BLASTRADIUS_ADMIN_KEY`; with a write-capable `GITHUB_TOKEN`, the server opens a **draft** PR and never merges it. Out-of-range fixes, changed dependency metadata, multiple affected copies, and non-npm lockfiles require manual review. No PR is opened against public examples without write access.
+### GitHub issue (human-approved)
 
-To show a real reviewable transitive action, scan `mercadopago/card-payment-bricks-sample-node` with `CVE-2021-44906`. Its tested lockfile has `hbs → handlebars → minimist@1.2.5`; the compatible 1.2.6 update produces a targeted lockfile diff. The module trace finds the static minimist import in Handlebars' CLI, not its main entry. That is a bounded observation, not a proof that the CLI never runs.
+For npm direct or transitive dependencies, BlastRadius checks whether the first patched version fits the immediate parent's declared range. For pinned Python requirements, it checks that the patched release is available on PyPI and that declared parent requirements permit it. The issue draft carries the affected dependency path, declared internet path or its absence, advisory and exploit signals, and the verified fix plan or a manual-review reason. A person can edit the draft before entering `BLASTRADIUS_ADMIN_KEY`; only then does the server use a write-capable `GITHUB_TOKEN` to create the issue. Filed issues are remembered in FalkorDB and shown on later investigations. The app does not change repository files.
+
+To show a real transitive fix plan, scan `mercadopago/card-payment-bricks-sample-node` with `CVE-2021-44906`. Its tested lockfile has `hbs → handlebars → minimist@1.2.5`; the compatible 1.2.6 update fits the parent's declared range and can be included in a reviewed GitHub issue. The module trace finds the static minimist import in Handlebars' CLI, not its main entry. That is a bounded observation, not a proof that the CLI never runs.
 
 ## Limits and submission transparency
 

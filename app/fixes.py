@@ -1,39 +1,15 @@
-"""Reviewable lockfile fix proposals and human-approved draft pull requests."""
+"""Evidence-checked fix plans for GitHub issue drafts."""
 
 from __future__ import annotations
 
-import difflib
-import copy
-import json
-import os
-import secrets
-import time
-from dataclasses import dataclass
-from urllib.parse import quote, urlparse
-
 import httpx
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from .advisories import Advisory, is_affected
 from .lockfile import parse_lockfile
-from .sources import Snapshot, fetch_public_projects
-
-
-PROPOSALS: dict[str, "Proposal"] = {}
-
-
-@dataclass
-class Proposal:
-    repo: str
-    sha: str
-    advisory: str
-    advisory_url: str
-    package: str
-    before: str
-    after: str
-    lockfile_text: str
-    lockfile_path: str
-    path: list[str]
-    expires_at: float
+from .pip_requirements import _via, parse_requirements
+from .sources import Snapshot
 
 
 def lockfile_refresh_plan(snapshot: Snapshot, advisory: Advisory, name: str) -> dict:
@@ -66,117 +42,41 @@ def _safe_target(advisory: Advisory, name: str, installed: str) -> str:
     return patched[0]
 
 
-async def build_preview(snapshot: Snapshot, advisory: Advisory, package: str, path: list[str]) -> tuple[str, dict]:
-    plan = lockfile_refresh_plan(snapshot, advisory, package)
-    installed, target = plan["before"], plan["target"]
-    if plan["strategy"] != "lockfile_refresh":
-        raise ValueError(f"First patched version {target} falls outside {plan['parent_name']}'s declared range {plan['declared_range']}; review a parent upgrade")
-    original = snapshot.lockfile_text or json.dumps(snapshot.lockfile, indent=2, ensure_ascii=False) + "\n"
-    registry_url = f"https://registry.npmjs.org/{quote(package, safe='')}/{quote(target, safe='')}"
-    async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-        response = await client.get(registry_url)
-        response.raise_for_status()
-        metadata = response.json()
-    if metadata.get("name") != package or metadata.get("version") != target:
-        raise ValueError("Registry metadata does not match the proposed package and version")
-    dist = metadata.get("dist", {})
-    resolved, integrity = dist.get("tarball"), dist.get("integrity")
-    parsed = urlparse(resolved or "")
-    if parsed.scheme != "https" or parsed.hostname != "registry.npmjs.org" or not integrity:
-        raise ValueError("Registry did not provide a verified public npm tarball")
-    updated = copy.deepcopy(snapshot.lockfile)
-    current = updated["packages"][plan["dependency_path"]]
-    for field in ("dependencies", "optionalDependencies", "peerDependencies"):
-        if (current.get(field) or {}) != (metadata.get(field) or {}):
-            raise ValueError(f"Patched package changes {field}; review an npm-generated upgrade")
-    current.update({"version": target, "resolved": resolved, "integrity": integrity})
-    legacy = updated.get("dependencies")
-    if isinstance(legacy, dict):
-        found = []
-        def visit(entries: dict) -> None:
-            for name, entry in entries.items():
-                if not isinstance(entry, dict):
+async def requirements_pin_plan(snapshot: Snapshot, advisory: Advisory, name: str) -> dict:
+    """Prove a one-line requirements.txt pin change is safe: the patched version exists on PyPI,
+    is not yanked, and every package that pulls this one in (pip-compile `# via`) allows it."""
+    if snapshot.manager != "pip":
+        raise ValueError("A requirements pin fix needs a Python requirements.txt project")
+    name = canonicalize_name(name)
+    text = snapshot.lockfile_text or ""
+    installed = {dep.name: dep.version for dep in parse_requirements(text)[0]}
+    if name not in installed:
+        raise ValueError(f"{name} is not pinned in {snapshot.lockfile_path}")
+    before = installed[name]
+    patched = [p.first_patched for p in advisory.packages if canonicalize_name(p.name) == name and p.first_patched
+               and is_affected(before, p.vulnerable_range, "PyPI") is True]
+    if not patched:
+        raise ValueError("The advisory has no patched version for the installed release")
+    target = patched[0]
+    if "--hash" in text:
+        raise ValueError(f"this file pins hashes, so regenerate it: pip-compile --upgrade-package {name}=={target}")
+    checked = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        release = await client.get(f"https://pypi.org/pypi/{name}/{target}/json")
+        if release.status_code != 200 or release.json().get("info", {}).get("yanked"):
+            raise ValueError(f"{name} {target} is not an available release on PyPI")
+        for parent in [canonicalize_name(r.split()[0]) for r in _via(text).get(name, []) if not r.startswith("-")]:
+            if parent not in installed:
+                continue
+            meta = await client.get(f"https://pypi.org/pypi/{parent}/{installed[parent]}/json")
+            meta.raise_for_status()
+            for spec in meta.json().get("info", {}).get("requires_dist") or []:
+                requirement = Requirement(spec)
+                if canonicalize_name(requirement.name) != name or (requirement.marker and "extra" in str(requirement.marker)):
                     continue
-                if name == package and entry.get("version") == installed:
-                    found.append(entry)
-                if isinstance(entry.get("dependencies"), dict):
-                    visit(entry["dependencies"])
-        visit(legacy)
-        if len(found) != 1:
-            raise ValueError("Legacy lockfile section does not identify exactly one matching package")
-        if (found[0].get("requires") or {}) != (metadata.get("dependencies") or {}):
-            raise ValueError("Patched package changes dependencies; review an npm-generated upgrade")
-        found[0].update({"version": target, "resolved": resolved, "integrity": integrity})
-    indent = 4 if '\n    "name"' in original[:200] else 2
-    updated_text = json.dumps(updated, indent=indent, ensure_ascii=False) + "\n"
-    parse_lockfile(updated)
-    remaining = [d for d in parse_lockfile(updated) if d.name == package]
-    if not remaining or any(is_affected(d.version, p.vulnerable_range) is not False
-                            for d in remaining for p in advisory.packages if p.name == package):
-        raise ValueError("npm did not resolve every installed instance to a verified unaffected version")
-    after = next((d.version for d in remaining if d.path == plan["dependency_path"]), remaining[0].version)
-    if updated_text == original:
-        raise ValueError("npm produced no lockfile change")
-    diff_lines = list(difflib.unified_diff(original.splitlines(), updated_text.splitlines(),
-                                          fromfile=f"a/{snapshot.lockfile_path}", tofile=f"b/{snapshot.lockfile_path}", lineterm=""))
-    if len(diff_lines) > 1000:
-        raise ValueError("The lockfile change is too large for the reviewable fix preview")
-    preview_id = secrets.token_urlsafe(24)
-    PROPOSALS[preview_id] = Proposal(snapshot.repo, snapshot.sha, advisory.identifier, advisory.url, package,
-                                      installed, after, updated_text, snapshot.lockfile_path, path, time.time() + 1800)
-    return preview_id, {"repo": snapshot.repo, "package": package, "before": installed, "after": after,
-                        "strategy": "lockfile_refresh", "parent": plan["parent_name"], "declared_range": plan["declared_range"],
-                        "diff": "\n".join(diff_lines), "truncated": False, "proposal_id": preview_id}
-
-
-async def create_draft_pr(proposal_id: str, admin_key: str) -> str:
-    expected = os.getenv("BLASTRADIUS_ADMIN_KEY")
-    token = os.getenv("GITHUB_TOKEN")
-    if not expected or not token:
-        raise ValueError("Draft PR creation requires BLASTRADIUS_ADMIN_KEY and GITHUB_TOKEN on the server")
-    if not secrets.compare_digest(admin_key, expected):
-        raise PermissionError("Incorrect approval key")
-    proposal = PROPOSALS.get(proposal_id)
-    if not proposal or proposal.expires_at < time.time():
-        raise ValueError("Fix proposal expired; review a fresh diff")
-    root_repo = proposal.repo.split("::")[0]
-    current = next((s for s in await fetch_public_projects(root_repo) if s.repo == proposal.repo), None)
-    if current is None or current.sha != proposal.sha:
-        raise ValueError("Repository changed since review; investigate and preview again")
-    headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}", "User-Agent": "BlastRadius-demo"}
-    repo = root_repo
-    lock_path = quote(proposal.lockfile_path, safe="/")
-    branch = f"blastradius/{proposal.advisory.lower()}-{secrets.token_hex(4)}"
-    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
-        meta = await client.get(f"https://api.github.com/repos/{repo}")
-        meta.raise_for_status()
-        base = meta.json()["default_branch"]
-        created = await client.post(f"https://api.github.com/repos/{repo}/git/refs", json={"ref": f"refs/heads/{branch}", "sha": proposal.sha})
-        created.raise_for_status()
-        file = await client.get(f"https://api.github.com/repos/{repo}/contents/{lock_path}", params={"ref": proposal.sha})
-        file.raise_for_status()
-        import base64
-        updated = await client.put(
-            f"https://api.github.com/repos/{repo}/contents/{lock_path}",
-            json={
-                "message": f"fix: update {proposal.package} for {proposal.advisory}",
-                "content": base64.b64encode(proposal.lockfile_text.encode()).decode(),
-                "sha": file.json()["sha"],
-                "branch": branch,
-            },
-        )
-        updated.raise_for_status()
-        proof = " → ".join(proposal.path)
-        body = (
-            f"## BlastRadius investigation\n\nAdvisory: {proposal.advisory} ({proposal.advisory_url})\n\n"
-            f"Dependency path: `{proof}`\n\nResolved `{proposal.package}` from `{proposal.before}` to `{proposal.after}`. "
-            f"Only `{proposal.lockfile_path}` changed. This is a draft for human review; run the repository's tests before merging.\n\n"
-            "BlastRadius checks package and declared network reachability, not function-level code reachability."
-        )
-        response = await client.post(
-            f"https://api.github.com/repos/{repo}/pulls",
-            json={"title": f"fix: address {proposal.advisory} in {proposal.package}", "head": branch, "base": base, "body": body, "draft": True},
-        )
-        response.raise_for_status()
-    del PROPOSALS[proposal_id]
-    return response.json()["html_url"]
+                if not requirement.specifier.contains(target, prereleases=True):
+                    raise ValueError(f"{parent} {installed[parent]} requires {name}{requirement.specifier}, "
+                                     f"which excludes {target}; upgrade {parent} first")
+                checked.append(f"{parent} {installed[parent]} allows {name}{requirement.specifier or ' (any)'}")
+    return {"package": name, "before": before, "target": target, "strategy": "requirements_pin",
+            "file": snapshot.lockfile_path, "parents_checked": checked}

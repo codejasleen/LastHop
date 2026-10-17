@@ -375,12 +375,3 @@ async def fetch_public_projects(repo: str, *, force_refresh: bool = True) -> lis
             raise
     _project_cache[repo] = (time.monotonic(), result)
     return result
-
-
-async def fetch_public_repo(repo: str) -> Snapshot:
-    """Return a root npm project for the current root-only draft PR workflow."""
-    projects = await fetch_public_projects(repo)
-    match = next((item for item in projects if not item.project_path and item.manager == "npm"), None)
-    if match is None:
-        raise ValueError("Automated draft PRs currently require a root npm package-lock.json")
-    return match

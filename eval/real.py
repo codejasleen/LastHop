@@ -1,4 +1,4 @@
-"""Reproduce an npm-audit versus BlastRadius comparison on a public repository."""
+"""Reproduce an npm-audit versus LastHop comparison on a public repository."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ PACKAGE = "form-data"
 
 
 def npm_audit(snapshot) -> bool | None:
-    with tempfile.TemporaryDirectory(prefix="blastradius-audit-") as folder:
+    with tempfile.TemporaryDirectory(prefix="lasthop-audit-") as folder:
         root = Path(folder)
         (root / "package-lock.json").write_text(snapshot.lockfile_text or "", encoding="utf-8")
         (root / "package.json").write_text(json.dumps(snapshot.package_json), encoding="utf-8")
@@ -46,9 +46,9 @@ async def main() -> None:
              f"Generated {datetime.now(timezone.utc).isoformat()} from [{REPO}](https://github.com/{REPO})",
              f"at commit `{scan['source']['sha']}`. Advisory: [{CVE}](https://github.com/advisories/{GHSA}).",
              "", "Both tools read the same committed npm lockfiles. `npm audit` identifies an affected package; "
-             "BlastRadius adds cross-service graph paths, declared Kubernetes reachability, and review priority. "
+             "LastHop adds cross-service graph paths, declared Kubernetes reachability, and review priority. "
              "This is a feature comparison, not an exploitability or accuracy benchmark.", "",
-             "| Project | npm audit: advisory | BlastRadius: affected path | Public entry path | Priority |", "|---|---|---|---|---|"]
+             "| Project | npm audit: advisory | LastHop: affected path | Public entry path | Priority |", "|---|---|---|---|---|"]
     for snapshot in (item for item in snapshots if item.manager == "npm"):
         result = by_repo[snapshot.repo]
         audit = npm_audit(snapshot)

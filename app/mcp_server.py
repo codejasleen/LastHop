@@ -1,4 +1,4 @@
-"""Bounded evidence tools for BlastRadius agents and external MCP clients."""
+"""Bounded evidence tools for LastHop agents and external MCP clients."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from .graph import GraphStore
 from .main import LiveScanRequest, ProvenanceRequest, provenance, scan_live
 
 
-mcp = FastMCP("BlastRadius", instructions="Use these read-only evidence tools. Never infer safety from missing evidence.")
+mcp = FastMCP("LastHop", instructions="Use these read-only evidence tools. Never infer safety from missing evidence.")
 
 
 @mcp.tool()

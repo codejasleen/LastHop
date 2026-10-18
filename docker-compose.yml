@@ -16,15 +16,15 @@ services:
     environment:
       FALKORDB_HOST: falkordb
       FALKORDB_PORT: "6379"
-      GRAPH_NAME: blastradius
+      GRAPH_NAME: lasthop
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
-      BLASTRADIUS_ADMIN_KEY: ${BLASTRADIUS_ADMIN_KEY:-}
+      LASTHOP_ADMIN_KEY: ${LASTHOP_ADMIN_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     ports:
-      - "${BLASTRADIUS_BIND:-127.0.0.1}:8000:8000"
+      - "${LASTHOP_BIND:-127.0.0.1}:8000:8000"
     depends_on:
       falkordb:
         condition: service_healthy

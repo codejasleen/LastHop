@@ -1,4 +1,4 @@
-"""BlastRadius agent. The LLM chooses which MCP tools to call, in what order, reading the FalkorDB
+"""LastHop agent. The LLM chooses which MCP tools to call, in what order, reading the FalkorDB
 graph as its context; every investigation is saved back to the graph as memory. If no LLM can
 take a turn, a fixed, clearly labelled pipeline runs instead."""
 
@@ -23,7 +23,7 @@ MAX_LLM_TOOL_CALLS = 10
 # who introduced something; advisory_fanout is a subset of graph_blast_radius.
 AGENT_TOOLS = ["recall_investigations", "scan_public_repo", "exposure_evidence", "cut_points", "graph_blast_radius",
                "decision_memory", "service_bridges", "query_graph", "graph_schema"]
-SYSTEM = """You are BlastRadius, a vulnerability-triage agent. Your context and memory is a FalkorDB graph of
+SYSTEM = """You are LastHop, a vulnerability-triage agent. Your context and memory is a FalkorDB graph of
 repositories, their installed dependencies, Kubernetes services and how the internet reaches them, owners, team
 decisions and your own past investigations. You decide which tools to call and in what order.
 

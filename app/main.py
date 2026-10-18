@@ -1,4 +1,4 @@
-"""BlastRadius API and web UI."""
+"""LastHop API and web UI."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 from .advisories import Advisory, fetch_advisory, is_affected
 from .graph import GraphStore, dependency_graph
@@ -22,7 +23,8 @@ from .webhooks import verify_push
 
 
 ROOT = Path(__file__).resolve().parent.parent
-app = FastAPI(title="BlastRadius", version="0.1.0")
+load_dotenv(ROOT / ".env")
+app = FastAPI(title="LastHop", version="0.1.0")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
@@ -416,7 +418,7 @@ class IssueCreateRequest(BaseModel):
 
 @app.post("/api/issues/draft")
 async def draft_github_issue(request: IssueDraftRequest) -> dict:
-    """BlastRadius writes the issue from the graph; the person edits it before approving."""
+    """LastHop writes the issue from the graph; the person edits it before approving."""
     from .issues import draft_issue
     from .risk_signals import fetch_risk_signals
 

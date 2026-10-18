@@ -1,4 +1,4 @@
-"""GitHub issues drafted from the graph's evidence. BlastRadius writes the draft; a person edits it
+"""GitHub issues drafted from the graph's evidence. LastHop writes the draft; a person edits it
 and approves the final create. Nothing is filed without the approval key."""
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def draft_issue(graph: GraphStore, project: str, advisory: Advisory, risk: dict[
         verdict = {"investigate": "Investigate further", "accepted_risk": "Risk accepted",
                    "remediated": "Remediated"}.get(last["verdict"], last["verdict"])
         lines.append(f"- Earlier team decision: {verdict} ({last['reason']})")
-    lines += ["", "---", "_Drafted by BlastRadius from its FalkorDB graph and reviewed by a person before filing. "
+    lines += ["", "---", "_Drafted by LastHop from its FalkorDB graph and reviewed by a person before filing. "
               "It checks package and declared network reachability, not function-level code reachability._"]
     return {"title": title[:256], "body": "\n".join(lines), "project": project}
 
@@ -88,12 +88,12 @@ def _fix_lines(package, fix: dict | None) -> list[str]:
 
 
 async def create_issue(root: str, title: str, body: str, admin_key: str) -> dict:
-    expected, token = os.getenv("BLASTRADIUS_ADMIN_KEY"), os.getenv("GITHUB_TOKEN")
+    expected, token = os.getenv("LASTHOP_ADMIN_KEY"), os.getenv("GITHUB_TOKEN")
     if not expected or not token:
-        raise ValueError("Creating issues needs BLASTRADIUS_ADMIN_KEY and GITHUB_TOKEN on the server")
+        raise ValueError("Creating issues needs LASTHOP_ADMIN_KEY and GITHUB_TOKEN on the server")
     if not secrets.compare_digest(admin_key, expected):
         raise PermissionError("Incorrect approval key")
-    headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}", "User-Agent": "BlastRadius"}
+    headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}", "User-Agent": "LastHop"}
     async with httpx.AsyncClient(timeout=20, headers=headers) as client:
         response = await client.post(f"https://api.github.com/repos/{root}/issues", json={"title": title, "body": body})
     if response.status_code == 410:

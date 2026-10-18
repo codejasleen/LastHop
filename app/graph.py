@@ -20,7 +20,7 @@ from .pip_requirements import parse_requirements
 class GraphStore:
     def __init__(self) -> None:
         db = FalkorDB(host=os.getenv("FALKORDB_HOST", "localhost"), port=int(os.getenv("FALKORDB_PORT", "6379")))
-        self.graph = db.select_graph(os.getenv("GRAPH_NAME", "blastradius"))
+        self.graph = db.select_graph(os.getenv("GRAPH_NAME", "lasthop"))
 
     def health(self) -> bool:
         self.graph.query("RETURN 1")

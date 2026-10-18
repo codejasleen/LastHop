@@ -57,7 +57,7 @@ def _git_history_fallback(repo: str, sha: str, lockfile_path: str, package_path:
         if process.returncode:
             raise RuntimeError(process.stderr[:200] or "git history command failed")
         return process.stdout
-    with tempfile.TemporaryDirectory(prefix="blastradius-provenance-") as folder:
+    with tempfile.TemporaryDirectory(prefix="lasthop-provenance-") as folder:
         root = Path(folder)
         checkout = root / "source"
         try:

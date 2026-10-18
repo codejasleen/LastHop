@@ -41,14 +41,14 @@ def test_draft_is_written_from_graph_facts_and_never_pings_owners():
 
 
 def test_issue_is_not_filed_without_the_approval_key(monkeypatch):
-    monkeypatch.setenv("BLASTRADIUS_ADMIN_KEY", "right")
+    monkeypatch.setenv("LASTHOP_ADMIN_KEY", "right")
     monkeypatch.setenv("GITHUB_TOKEN", "t")
     with pytest.raises(PermissionError):
         asyncio.run(issues.create_issue("o/boutique", "title", "body text long enough", "wrong"))
 
 
 def test_disabled_issues_on_a_fork_give_a_clear_message(monkeypatch):
-    monkeypatch.setenv("BLASTRADIUS_ADMIN_KEY", "right")
+    monkeypatch.setenv("LASTHOP_ADMIN_KEY", "right")
     monkeypatch.setenv("GITHUB_TOKEN", "t")
     real = httpx.AsyncClient
     monkeypatch.setattr(issues.httpx, "AsyncClient",
@@ -58,7 +58,7 @@ def test_disabled_issues_on_a_fork_give_a_clear_message(monkeypatch):
 
 
 def test_filed_issue_returns_its_link(monkeypatch):
-    monkeypatch.setenv("BLASTRADIUS_ADMIN_KEY", "right")
+    monkeypatch.setenv("LASTHOP_ADMIN_KEY", "right")
     monkeypatch.setenv("GITHUB_TOKEN", "t")
     sent = []
 

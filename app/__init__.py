@@ -1,1 +1,1 @@
-"""BlastRadius application."""
+"""LastHop application."""

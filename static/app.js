@@ -2,15 +2,15 @@ const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 
 const VERDICT = {
-  affected_exposed: {cls: 'bad', label: 'Affected · reachable from internet'},
-  declared_exposed: {cls: 'bad', label: 'Python pin · reachable from internet'},
-  affected_internal_declared: {cls: 'warn', label: 'Affected · internal only'},
-  declared_internal: {cls: 'warn', label: 'Python pin · internal only'},
-  affected_exposure_unknown: {cls: 'warn', label: 'Affected · exposure unknown'},
-  declared_exposure_unknown: {cls: 'warn', label: 'Python pin · exposure unknown'},
-  insufficient_evidence: {cls: 'warn', label: 'Insufficient evidence'},
-  not_affected_version: {cls: 'good', label: 'Version not affected'},
-  not_present: {cls: 'good', label: 'Package not present'},
+  affected_exposed: {cls: 'bad', label: 'Reachable'},
+  declared_exposed: {cls: 'bad', label: 'Reachable'},
+  affected_internal_declared: {cls: 'warn', label: 'Internal'},
+  declared_internal: {cls: 'warn', label: 'Internal'},
+  affected_exposure_unknown: {cls: 'warn', label: 'Exposure unknown'},
+  declared_exposure_unknown: {cls: 'warn', label: 'Exposure unknown'},
+  insufficient_evidence: {cls: 'warn', label: 'Needs review'},
+  not_affected_version: {cls: 'good', label: 'Safe version'},
+  not_present: {cls: 'good', label: 'Not present'},
   not_applicable: {cls: 'skip', label: 'Different ecosystem'},
 };
 const ICON = {bad: '✕', warn: '!', good: '✓', skip: '–'};
@@ -35,7 +35,7 @@ const CHOSEN_BY = {
   guard: ['label', 'added by a safety guard'],
   fallback: ['label attention', 'fixed fallback order'],
 };
-const HISTORY_KEY = 'blastradius.investigations';
+const HISTORY_KEY = 'lasthop.investigations';
 
 let current = null;   // {id, repo, advisory, question, at, data}
 let cy = null;
@@ -120,9 +120,7 @@ function renderHistory() {
 async function refreshSidebar() {
   try {
     const [health, repos] = await Promise.all([api('/api/health'), api('/api/repos')]);
-    const ok = health.database === 'connected';
-    $('conn').querySelector('.dot').className = `dot ${ok ? 'ok' : 'bad'}`;
-    $('conn-label').textContent = ok ? 'FalkorDB connected' : 'FalkorDB unavailable';
+    if (health.database !== 'connected') toast('FalkorDB is unavailable. Start it with docker compose up -d.', true);
     const groups = {};
     for (const r of repos) {
       const base = r.repo.split('::')[0];
@@ -136,8 +134,7 @@ async function refreshSidebar() {
       <div class="side-item-sub">${groups[n].count} project${groups[n].count === 1 ? '' : 's'} · ${[...groups[n]].join(', ')}</div></button></li>`).join('')
       : '<li class="side-empty">None yet</li>';
   } catch {
-    $('conn').querySelector('.dot').className = 'dot bad';
-    $('conn-label').textContent = 'FalkorDB unavailable';
+    toast('FalkorDB is unavailable. Start it with docker compose up -d.', true);
   }
 }
 
@@ -212,16 +209,10 @@ function renderHeader(entry, scan) {
   // them as alarms when something here is actually affected.
   const hit = scan.results.some(r => r.vulnerable_paths?.length);
   const sevClass = !hit ? '' : ['critical', 'high'].includes(sev) ? 'danger' : sev === 'moderate' || sev === 'medium' ? 'attention' : '';
-  const labels = [
-    `<span class="label ${sevClass}" title="Severity the advisory assigns to the vulnerability in general (CVSS). It says how bad the flaw is if you are affected, not whether you are.">Advisory severity: ${esc(sev)}</span>`,
-    risk.kev === true ? `<span class="label ${hit ? 'danger' : ''}" title="CISA Known Exploited Vulnerabilities: the US government's list of flaws attackers are using right now.">CISA KEV: actively exploited</span>`
-      : risk.kev === false ? '<span class="label" title="CISA Known Exploited Vulnerabilities: the US government\'s list of flaws attackers are using right now. This one is not on it.">Not in CISA KEV</span>' : '<span class="label">KEV unknown</span>',
-    risk.epss != null ? `<span class="label ${hit && risk.epss_percentile >= 0.9 ? 'danger' : ''}" title="EPSS (FIRST.org): estimated probability this flaw is exploited anywhere in the next 30 days, and how it ranks against all CVEs.">EPSS ${(risk.epss * 100).toFixed(2)}% · ${Math.round((risk.epss_percentile || 0) * 100)}th pct</span>` : '<span class="label">EPSS unknown</span>',
-  ];
-  const fan = entry.data.evidence.advisory_fanout;
-  if (fan) labels.push(`<span class="label accent">Graph fan-out: ${fan.count} project${fan.count === 1 ? '' : 's'}</span>`);
+  const labels = [`<span class="label ${sevClass}" title="Advisory severity: how bad the flaw is, not whether you are affected">${esc(sev)} severity</span>`];
+  if (risk.kev === true) labels.push(`<span class="label ${hit ? 'danger' : ''}" title="On CISA's Known Exploited Vulnerabilities list">Actively exploited (CISA KEV)</span>`);
+  if (risk.epss != null) labels.push(`<span class="label ${hit && risk.epss_percentile >= 0.9 ? 'danger' : ''}" title="FIRST EPSS: chance of exploitation in the next 30 days">EPSS ${(risk.epss * 100).toFixed(2)}%</span>`);
   // Say plainly what was NOT scanned, so a clean result is never mistaken for full coverage.
-  const scanned = (src.project_paths || []).map(p => p === '.' ? 'repository root' : p);
   const LANG = {'go.mod': 'Go', 'pom.xml': 'Java', 'build.gradle': 'Java', 'build.gradle.kts': 'Java', 'Cargo.lock': 'Rust',
                 'Gemfile.lock': 'Ruby', 'poetry.lock': 'Python (Poetry)', 'uv.lock': 'Python (uv)'};
   const byLang = {};
@@ -231,18 +222,14 @@ function renderHeader(entry, scan) {
     (byLang[lang] ||= new Set()).add(parts.filter(p => p !== 'src').pop() || 'repository root');
   }
   const skipped = Object.entries(byLang).map(([lang, names]) => `${[...names].join(', ')} (${lang})`);
-  const coverage = scanned.length ? `<div class="coverage">Dependency files loaded into the graph: ${esc(scanned.join(', '))}`
-    + (skipped.length ? ` · <b>Not analyzed (unsupported language):</b> ${esc(skipped.join(' · '))}` : '') + '</div>' : '';
+  const coverage = skipped.length ? `<div class="coverage"><b>Not scanned (unsupported language):</b> ${esc(skipped.join(' · '))}</div>` : '';
   $('r-labels').innerHTML = labels.join('') + coverage;
 }
 
 function renderVerdict(entry, scan) {
   const rel = scan.results.filter(r => r.verdict !== 'not_applicable');
-  const skipped = scan.results.length - rel.length;
   const affected = rel.filter(r => r.vulnerable_paths?.length);
   const exposed = rel.filter(r => vclass(r) === 'bad');
-  const unknown = affected.filter(r => /exposure_unknown/.test(r.verdict)).length;
-  const fixes = affected.filter(fixable).length;
   let cls, icon, title;
   if (exposed.length) {
     cls = 'bad'; icon = '✕';
@@ -256,16 +243,15 @@ function renderVerdict(entry, scan) {
   }
   const lines = [];
   if (exposed.length) lines.push(`Reachable: ${exposed.map(r => projectName(r.repo)).join(', ')}`);
-  if (unknown) lines.push(`${unknown} with no deployment evidence (exposure unknown)`);
-  if (affected.length) lines.push(fixes ? `Verified fix for ${fixes} project${fixes === 1 ? '' : 's'}; raise an issue from each row` : 'Fix needs manual review; raise an issue from each row');
-  if (skipped) lines.push(`${skipped} project${skipped === 1 ? '' : 's'} in another ecosystem skipped`);
   const others = otherRepoRows(entry);
-  if (others.length) lines.push(`Advisory-linked affected packages also appear in ${[...new Set(others.map(o => o.repo))].join(', ')} (graph)`);
-  const source = entry.data.summary_source === 'deterministic' ? 'rule-based summary' : esc(entry.data.summary_source || 'agent');
+  if (others.length) lines.push(`Also in ${[...new Set(others.map(o => o.repo))].join(', ')}`);
+  const a = entry.data.agent || {};
+  const run = a.mode === 'llm' ? `${a.model} chose ${a.chosen_by_llm} of ${a.steps} tool calls`
+    : a.mode === 'fallback' ? 'fixed tool order (no LLM available)' : `${entry.data.tool_trace?.length || 0} tool calls`;
   $('r-verdict').className = `verdict ${cls}`;
   $('r-verdict').innerHTML = `<div class="verdict-icon">${icon}</div><div>
-    <h2>${esc(title)}</h2><p>${esc(lines.join(' · '))}</p>
-    ${entry.data.summary ? `<div class="agent-says"><span class="who">Agent · ${source}</span><br>${esc(entry.data.summary)}</div>` : ''}
+    <h2>${esc(title)}</h2>${lines.length ? `<p>${esc(lines.join(' · '))}</p>` : ''}
+    <div class="agent-line">Agent: ${esc(run)} · <button type="button" class="linkish" data-tab="agent">see how it got here</button></div>
   </div>`;
 }
 
@@ -280,24 +266,17 @@ function cutHtml(r) {
   if (!cp || !cp.rows?.length) return '';
   const all = cp.shared_by_all || [];
   const total = cp.rows[0].total;
-  const query = `<details class="raw"><summary>Cypher · ${esc(cp.db_ms)} ms in FalkorDB</summary><pre>${esc(cp.cypher)}</pre></details>`;
+  const query = `<details class="raw"><summary>Cypher · ${esc(cp.db_ms)} ms</summary><pre>${esc(cp.cypher)}</pre></details>`;
   if (!all.length) {
     const top = cp.rows[0];
-    return `<div class="callout"><b>No single cut point:</b> the ${total} paths split early. The most shared package is ${esc(top.package)} (${top.through} of ${total} paths).${query}</div>`;
+    return `<div class="callout"><b>No single entry point:</b> most shared is ${esc(top.package)} (${top.through} of ${total} paths).${query}</div>`;
   }
-  const first = all[0];
-  const vulnerable = r.vulnerable_paths?.[0]?.package || 'the vulnerable package';
   const chain = all.map(p => `<code>${esc(p.package)}</code>`).join(' → ');
-  const how = first.depth === 1
-    ? `${esc(first.package)} is a <b>direct dependency</b> of this project`
-    : `${esc(first.package)} is pulled in ${first.depth} levels deep`;
-  return `<div class="callout accent-callout"><b>Where it enters:</b> all ${total} of ${total} dependency paths pass through ${chain}. ${how}, so it is the single doorway through which ${esc(vulnerable)} reaches this service: the place to look, change and test. The fix itself is the patched ${esc(vulnerable)} version under Fix.${query}</div>`;
+  return `<div class="callout accent-callout"><b>Enters through</b> ${chain}: all ${total} of ${total} paths pass through it.${query}</div>`;
 }
 
 const ECOSYSTEM_NAME = {npm: 'npm (JavaScript)', PyPI: 'PyPI (Python)'};
 const advisoryEcosystems = (scan) => [...new Set((scan.advisory.packages || []).map(p => ECOSYSTEM_NAME[p.split(':')[0]] || p.split(':')[0]))].join(' and ') || 'other';
-const skipEcosystem = (skip) => skip.every(x => x.r.repo.includes('#pip')) ? 'they are Python projects'
-  : skip.every(x => !x.r.repo.includes('#pip')) ? 'they are JavaScript (npm) projects' : 'they use a different package manager';
 
 // ---------- overview: checks list ----------
 function exposureLine(r) {
@@ -350,8 +329,7 @@ function checkHtml(r, scan, idx) {
   const why = affected
     ? `${exposureLine(r)}<div class="muted">${esc(vp.package)} ${esc(vp.version)} · ${vp.path.length - 1} hop${vp.path.length === 2 ? '' : 's'} · ${total} path${total === 1 ? '' : 's'}${fixes[0] ? ` · fix → ${esc(fixes[0].target || fixes[0].first_patched)}` : ''}</div>`
     : `<span class="muted">${esc(r.explanation)}</span>`;
-  const priority = r.priority && r.priority !== 'None' ? r.priority : null;
-  const chip = affected ? `<span class="label ${c === 'bad' ? 'danger' : 'attention'} check-chip">${esc(priority && priority.startsWith('P') ? `${priority} provisional` : (VERDICT[r.verdict] || {}).label || r.verdict)}</span>`
+  const chip = affected ? `<span class="label ${c === 'bad' ? 'danger' : 'attention'} check-chip">${esc((VERDICT[r.verdict] || {}).label || r.verdict)}</span>`
     : `<span class="label success check-chip">${esc((VERDICT[r.verdict] || {}).label || r.verdict)}</span>`;
   const svcWithPath = (r.services || []).find(s => s.exposure_path?.length);
   const decision = r.prior_decisions?.[0];
@@ -359,18 +337,17 @@ function checkHtml(r, scan, idx) {
       <div class="detail-grid">
         <div><div class="detail-title">Dependency path · shortest of ${total}</div>${treeHtml(vp.path, r, vp)}
           ${paths.length > 1 ? `<details class="raw more-paths"><summary>${total - 1} more path${total === 2 ? '' : 's'}${total > paths.length ? ` (next ${paths.length - 1} shown)` : ''}</summary>${paths.slice(1).map(p => treeHtml(p.path, r, p)).join('<br>')}</details>` : ''}</div>
-        <div><div class="detail-title">Exposure path · from deployment manifests</div>
+        <div><div class="detail-title">Exposure path · from Kubernetes manifests</div>
           ${svcWithPath ? stepsHtml(svcWithPath)
-            : (r.services || []).length ? `<div class="callout success"><b>Internal only:</b> the manifests declare ${(r.services || []).map(s => `<code>${esc(s.name)}</code>`).join(', ')}, and the graph finds no path from the internet to ${(r.services || []).length === 1 ? 'it' : 'them'} (no public route, no caller chain).</div>`
-            : '<div class="callout attention">No Kubernetes manifest for this service was found in the deployment folders BlastRadius reads (<code>kubernetes-manifests/</code>, <code>k8s/</code>, <code>kubernetes/</code>, <code>deploy/</code>), so whether the internet can reach it is unknown. The vulnerable package is still installed; BlastRadius does not guess the exposure.</div>'}</div>
+            : (r.services || []).length ? '<div class="callout success"><b>Internal only:</b> no route from the internet reaches it.</div>'
+            : '<div class="callout attention"><b>Exposure unknown:</b> no Kubernetes manifest found for this service.</div>'}</div>
       </div>
       ${cutHtml(r)}
       ${moduleHtml(r)}
       <dl class="facts">
-        <dt>Owner</dt><dd>${esc(r.owner || 'unknown (no CODEOWNERS)')}</dd>
         <dt>Fix</dt><dd>${fixText}</dd>
-        <dt>Why this priority</dt><dd>${esc((r.priority_reasons || []).join(' · ') || r.explanation)}</dd>
-        <dt>Last decision</dt><dd>${decision ? `<b>${esc(decision.verdict)}</b> · ${esc(decision.reason)} ${decision.stale ? '<span class="label attention">re-review: repository changed</span>' : ''}` : '<span class="muted">none recorded</span>'}</dd>
+        <dt>Owner</dt><dd>${esc(r.owner || 'unknown (no CODEOWNERS)')}</dd>
+        ${decision ? `<dt>Last decision</dt><dd><b>${esc(decision.verdict)}</b> · ${esc(decision.reason)} ${decision.stale ? '<span class="label attention">re-review: repository changed</span>' : ''}</dd>` : ''}
       </dl>
       <div class="row-actions">
         <button class="btn btn-sm btn-primary" data-issue="${idx}" type="button">Raise GitHub issue</button>
@@ -398,12 +375,11 @@ function cleanProofHtml(r, scan) {
   const packages = (scan.advisory.packages || []).filter(p => p.startsWith(`${ecosystem}:`)).map(p => p.slice(ecosystem.length + 1));
   const named = packages.length ? packages.map(p => `<code>${esc(p)}</code>`).join(', ') : 'the advisory\'s package';
   if (r.verdict === 'not_present') {
-    return `<div class="check-detail"><div class="callout success"><b>Proof:</b> searched ${esc(r.dependency_count ?? '?')} packages from ${where} at commit <code>${esc(sha)}</code>. ${named} ${packages.length === 1 ? 'is' : 'are'} not among them, so this scanned project has no dependency path to that package.</div></div>`;
+    return `<div class="check-detail"><div class="callout success">Searched ${esc(r.dependency_count ?? '?')} packages in ${where} at <code>${esc(sha)}</code>: ${named} not found.</div></div>`;
   }
   if (r.verdict === 'not_affected_version') {
-    const recordedAs = ecosystem === 'PyPI' ? 'is pinned' : 'is installed';
-    const rows = (r.checked_paths || []).map(p => `<li><code>${esc(p.package)} ${esc(p.version)}</code> ${recordedAs}; the affected range is <code>${esc(p.range)}</code>, so this version is outside it.</li>`).join('');
-    return `<div class="check-detail"><div class="callout success"><b>Proof:</b> the package is present in ${where} at commit <code>${esc(sha)}</code>, at a version outside this advisory's affected range:<ul>${rows}</ul></div></div>`;
+    const rows = (r.checked_paths || []).map(p => `<li><code>${esc(p.package)} ${esc(p.version)}</code> is outside the affected range <code>${esc(p.range)}</code></li>`).join('');
+    return `<div class="check-detail"><div class="callout success">In ${where} at <code>${esc(sha)}</code>:<ul>${rows}</ul></div></div>`;
   }
   return '';
 }
@@ -416,10 +392,10 @@ function renderOverview(scan) {
   $('c-overview').textContent = rel.length;
   const skipRow = skip.length ? `<div class="check"><div class="check-row static">
       <span class="s-icon s-skip">–</span>
-      <div><div class="check-name">${skip.length} project${skip.length === 1 ? '' : 's'} not relevant to this advisory</div><div class="check-sub">scanned, but ${esc(skipEcosystem(skip))}; this advisory only affects ${esc(advisoryEcosystems(scan))} packages</div></div>
+      <div><div class="check-name">${skip.length} project${skip.length === 1 ? '' : 's'} not relevant</div><div class="check-sub">this advisory only affects ${esc(advisoryEcosystems(scan))} packages</div></div>
       <div class="check-why muted">${esc(skip.map(x => projectName(x.r.repo)).join(', '))}</div><span></span><span></span></div></div>` : '';
   $('tab-overview').innerHTML = `<div class="box checks">
-    <div class="box-header"><span>${rel.length} project${rel.length === 1 ? '' : 's'} checked · ${bad} reachable from the internet</span>${rel.some(x => x.r.verdict !== 'insufficient_evidence') ? '<span class="muted small">Click a row for its proof</span>' : ''}</div>
+    <div class="box-header"><span>${rel.length} project${rel.length === 1 ? '' : 's'} checked · ${bad} reachable from the internet</span>${rel.some(x => x.r.verdict !== 'insufficient_evidence') ? '<span class="muted small">Click a row for details</span>' : ''}</div>
     ${rel.map(x => checkHtml(x.r, scan, x.idx)).join('')}${skipRow}</div>`;
   const first = $('tab-overview').querySelector('.check [data-toggle]');
   if (first) first.parentElement.classList.add('open');
@@ -532,8 +508,7 @@ function drawGraph() {
   cy.fit(undefined, 30);
   renderGraphQuery(current);
   const bridges = (current.data.evidence.service_bridges?.services || []).filter(s => s.betweenness > 0).slice(0, 4);
-  $('graph-note').textContent = `Shortest dependency path per affected project, joined to its exposure path from the Kubernetes manifests. `
-    + (bridges.length ? `Service size = betweenness (algo.betweenness): ${bridges.map(s => `${s.service} ${s.betweenness}`).join(', ')}.` : '');
+  $('graph-note').textContent = bridges.length ? `Larger services sit on more call paths (algo.betweenness): ${bridges.map(s => `${s.service} ${s.betweenness}`).join(', ')}.` : '';
 }
 
 function renderGraphQuery(entry) {
@@ -576,8 +551,7 @@ function renderAgent(entry) {
     const [chipClass, chipText] = CHOSEN_BY[step.selected_by] || CHOSEN_BY.fallback;
     return `<li class="tl-item"><div class="tl-badge ${ok ? 'ok' : 'err'}">${ok ? '✓' : '✕'}</div><div class="tl-body">
       <div class="tl-title"><code>${esc(step.tool)}</code> <span class="${chipClass}">${chipText}</span> <span class="muted small">${esc(args)}</span></div>
-      ${step.reason ? `<div class="tl-reason">“${esc(step.reason)}”</div>` : ''}
-      <div class="tl-sub">${esc(TOOL_DESC[step.tool] || '')}</div>
+      ${step.reason ? `<div class="tl-reason">“${esc(step.reason)}”</div>` : `<div class="tl-sub">${esc(TOOL_DESC[step.tool] || '')}</div>`}
       ${raw ? `<details class="raw"><summary>Tool output</summary><pre>${esc(JSON.stringify(raw, null, 2).slice(0, 5000))}</pre></details>` : ''}
     </div></li>`;
   }).join('');
@@ -585,17 +559,17 @@ function renderAgent(entry) {
   const a = d.agent || {};
   const recalled = ev.recall_investigations?.previous || [];
   const banner = a.mode === 'llm'
-    ? `<div class="callout accent-callout" style="margin:0 0 12px"><b>Agent run:</b> ${esc(a.model)} chose ${a.chosen_by_llm} of ${a.steps} tool calls itself, reading the FalkorDB graph as its context.
-       ${recalled.length ? ` It recalled ${recalled.length} earlier investigation${recalled.length === 1 ? '' : 's'} of this repo from the graph.` : ' No earlier investigation of this repo was in memory.'}
-       ${a.saved_investigation ? ' This run was saved to the graph as an Investigation node.' : ''}</div>`
+    ? `<div class="callout accent-callout" style="margin:0 0 12px">${esc(a.model)} chose ${a.chosen_by_llm} of ${a.steps} tool calls
+       · ${recalled.length ? `recalled ${recalled.length} earlier investigation${recalled.length === 1 ? '' : 's'}` : 'first investigation of this repo'}
+       ${a.saved_investigation ? '· saved to the graph' : ''}</div>`
     : a.mode === 'fallback'
-      ? `<div class="callout attention" style="margin:0 0 12px"><b>Fallback run:</b> no LLM could take a turn (${esc(a.reason || '')}), so a fixed tool order was used.</div>` : '';
+      ? `<div class="callout attention" style="margin:0 0 12px"><b>Fallback run:</b> no LLM available (${esc(a.reason || '')}), so a fixed tool order was used.</div>` : '';
   $('tab-agent').innerHTML = banner + `<ol class="timeline">
     <li class="tl-item"><div class="tl-badge user">?</div><div class="tl-body"><div class="comment">
       <div class="comment-head"><b>You</b> asked</div><div class="comment-body">${esc(entry.question)}</div></div></div></li>
     ${steps}
     <li class="tl-item"><div class="tl-badge agent">◎</div><div class="tl-body"><div class="comment">
-      <div class="comment-head"><b>BlastRadius agent</b> answered · ${source}</div>
+      <div class="comment-head"><b>LastHop agent</b> answered · ${source}</div>
       <div class="comment-body">${esc(d.summary)}<p class="muted small" style="margin:8px 0 0">${esc(d.limits || '')}</p></div></div></div></li>
   </ol>`;
 }
@@ -610,20 +584,20 @@ function renderHistoryTab(scan) {
       <div class="tl-title"><b>${esc(projectName(r.repo))}</b> · ${esc(VERDICT_WORDS[d.verdict] || d.verdict)}
         ${d.stale ? '<span class="label attention">made on an older commit: re-review</span>' : '<span class="label success">current commit</span>'}</div>
       <div class="tl-sub">“${esc(d.reason)}” · ${esc(when(d.created_at))}</div></div></li>`)).join('')}</ol>`
-    : '<div class="box-row muted">No team decisions recorded for this advisory yet. Record one from a row in Overview; it is stored in FalkorDB and shown here.</div>';
+    : '<div class="box-row muted">None yet.</div>';
   const previous = current?.data.evidence.recall_investigations?.previous || [];
   const runs = previous.length ? `<ol class="timeline">${previous.map(p => `<li class="tl-item"><div class="tl-badge agent">◎</div><div class="tl-body">
       <div class="tl-title"><b>${esc(p.advisory)}</b> · ${esc(p.affected)} affected, ${esc(p.reachable)} reachable · commit <code>${esc((p.sha || '').slice(0, 7))}</code></div>
       <div class="tl-sub">${esc(when(p.created_at))} · ${esc(String(p.answer || '').slice(0, 220))}${String(p.answer || '').length > 220 ? '…' : ''}</div></div></li>`).join('')}</ol>`
-    : '<div class="box-row muted">This was the agent\'s first investigation of this repo. It is now saved in the graph and will be recalled next time.</div>';
+    : '<div class="box-row muted">None yet. This run is saved and will be recalled next time.</div>';
   const filed = scan.results.flatMap(r => (r.issues || []).map(i => ({...i, service: projectName(r.repo)})));
   const issues = filed.length ? `<ol class="timeline">${filed.map(i => `<li class="tl-item"><div class="tl-badge ok">!</div><div class="tl-body">
       <div class="tl-title"><a href="${esc(i.url)}" target="_blank" rel="noopener noreferrer">#${esc(i.number)}</a> · <b>${esc(i.service)}</b> · ${esc(i.title || '')}</div>
       <div class="tl-sub">${esc(when(i.created_at))}</div></div></li>`).join('')}</ol>`
-    : '<div class="box-row muted">No GitHub issue filed for this advisory yet. Raise one from an affected row in Overview.</div>';
+    : '<div class="box-row muted">None yet.</div>';
   $('tab-history').innerHTML = `<div class="box" style="margin-bottom:16px"><div class="box-header"><span>GitHub issues filed</span></div><div class="box-row">${issues}</div></div>
     <div class="box" style="margin-bottom:16px"><div class="box-header"><span>Team decisions</span></div><div class="box-row">${decisions}</div></div>
-    <div class="box"><div class="box-header"><span>Earlier agent investigations of this repo (memory)</span></div><div class="box-row">${runs}</div></div>`;
+    <div class="box"><div class="box-header"><span>Earlier agent investigations</span></div><div class="box-row">${runs}</div></div>`;
 }
 
 async function provenance(idx, button) {
@@ -640,15 +614,7 @@ async function provenance(idx, button) {
 }
 
 // ---------- tabs + events ----------
-const TAB_INTRO = {
-  overview: 'One row per scanned project: ✕ affected and reachable from the internet, ! affected but not proven reachable, ✓ not affected. Open a row to see its evidence.',
-  graph: 'How the internet reaches each affected service, and how the vulnerable package reaches that service, drawn from FalkorDB. Below it, the single Cypher query that computes the blast radius across every repo in the graph.',
-  agent: 'What the agent decided: each MCP tool it chose, why, and exactly what that tool returned from the graph, then its answer. The answer may only use facts from these outputs.',
-  history: 'Memory from the graph: GitHub issues filed, decisions your team recorded for this advisory, and what the agent concluded in earlier investigations of this repo.',
-};
-
 function selectTab(name) {
-  $('tab-intro').textContent = TAB_INTRO[name] || '';
   for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t.dataset.tab === name);
   for (const p of document.querySelectorAll('.tab-panel')) p.classList.toggle('hidden', p.id !== `tab-${name}`);
   if (name === 'graph') drawGraph();
@@ -702,7 +668,7 @@ $('decision-form').addEventListener('submit', async (e) => {
     toast('Decision saved to the graph. It is shown below and will be recalled in future investigations.');
   } catch (err) { toast(err.message, true); }
 });
-// ---------- GitHub issue: drafted by BlastRadius, edited and approved by a person ----------
+// ---------- GitHub issue: drafted by LastHop, edited and approved by a person ----------
 let issueIdx = null;
 async function openIssueDraft(idx, button) {
   const scan = current.data.evidence.scan_public_repo;

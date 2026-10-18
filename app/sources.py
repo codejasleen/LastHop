@@ -67,7 +67,7 @@ class Snapshot:
 
 
 def _headers() -> dict[str, str]:
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "BlastRadius-demo"}
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "LastHop-demo"}
     if token := os.getenv("GITHUB_TOKEN"):
         headers["Authorization"] = f"Bearer {token}"
     return headers
@@ -273,7 +273,7 @@ async def _snapshots_from_files(
 async def _fetch_public_projects_archive(repo: str) -> list[Snapshot]:
     """Use a bounded public source archive when GitHub's API quota is exhausted."""
     try:
-        async with httpx.AsyncClient(timeout=40, follow_redirects=True, headers={"User-Agent": "BlastRadius-demo"}) as client:
+        async with httpx.AsyncClient(timeout=40, follow_redirects=True, headers={"User-Agent": "LastHop-demo"}) as client:
             async with client.stream("GET", f"https://codeload.github.com/{repo}/zip/HEAD") as response:
                 response.raise_for_status()
                 chunks: list[bytes] = []
@@ -327,7 +327,7 @@ async def _fetch_public_projects_git(repo: str, remote_url: str | None = None) -
             raise SourceAcquisitionError("Public Git checkout was unavailable")
         return process.stdout
 
-    with tempfile.TemporaryDirectory(prefix="blastradius-source-") as folder:
+    with tempfile.TemporaryDirectory(prefix="lasthop-source-") as folder:
         root = Path(folder)
         checkout = root / "repo"
         await asyncio.to_thread(run, root, "clone", "--filter=blob:none", "--no-checkout", "--depth=1",

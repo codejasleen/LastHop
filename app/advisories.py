@@ -66,7 +66,7 @@ def _osv_packages(item: dict) -> list[AffectedPackage]:
 
 
 async def _fetch_osv_advisory(identifier: str) -> Advisory:
-    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "BlastRadius-demo"}) as client:
+    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "LastHop-demo"}) as client:
         response = await client.get(f"https://api.osv.dev/v1/vulns/{identifier}")
         if response.status_code == 404:
             raise LookupError("No public advisory was found for that identifier")
@@ -100,7 +100,7 @@ async def fetch_advisory(identifier: str) -> Advisory:
     if not IDENTIFIER.fullmatch(identifier):
         raise ValueError("Enter a CVE or GHSA identifier")
     params = {"cve_id" if identifier.startswith("CVE-") else "ghsa_id": identifier}
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "BlastRadius-demo"}
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "LastHop-demo"}
     if token := os.getenv("GITHUB_TOKEN"):
         headers["Authorization"] = f"Bearer {token}"
     async with httpx.AsyncClient(timeout=12, headers=headers) as client:
